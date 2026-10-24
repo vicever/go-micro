@@ -1,17 +1,38 @@
 package server
 
+import (
+	"bytes"
+
+	"go-micro.dev/v6/codec"
+	"go-micro.dev/v6/internal/util/buf"
+	"go-micro.dev/v6/transport"
+)
+
 type rpcRequest struct {
+	socket      transport.Socket
+	codec       codec.Codec
+	rawBody     interface{}
+	header      map[string]string
 	service     string
 	method      string
+	endpoint    string
 	contentType string
-	request     interface{}
+	body        []byte
 	stream      bool
+	first       bool
 }
 
-type rpcPublication struct {
+type rpcMessage struct {
+	payload     interface{}
+	header      map[string]string
+	codec       codec.NewCodec
 	topic       string
 	contentType string
-	message     interface{}
+	body        []byte
+}
+
+func (r *rpcRequest) Codec() codec.Reader {
+	return r.codec
 }
 
 func (r *rpcRequest) ContentType() string {
@@ -26,22 +47,61 @@ func (r *rpcRequest) Method() string {
 	return r.method
 }
 
-func (r *rpcRequest) Request() interface{} {
-	return r.request
+func (r *rpcRequest) Endpoint() string {
+	return r.endpoint
+}
+
+func (r *rpcRequest) Header() map[string]string {
+	return r.header
+}
+
+func (r *rpcRequest) Body() interface{} {
+	return r.rawBody
+}
+
+func (r *rpcRequest) Read() ([]byte, error) {
+	// got a body
+	if r.first {
+		b := r.body
+		r.first = false
+		return b, nil
+	}
+
+	var msg transport.Message
+	err := r.socket.Recv(&msg)
+	if err != nil {
+		return nil, err
+	}
+	r.header = msg.Header
+
+	return msg.Body, nil
 }
 
 func (r *rpcRequest) Stream() bool {
 	return r.stream
 }
 
-func (r *rpcPublication) ContentType() string {
+func (r *rpcMessage) ContentType() string {
 	return r.contentType
 }
 
-func (r *rpcPublication) Topic() string {
+func (r *rpcMessage) Topic() string {
 	return r.topic
 }
 
-func (r *rpcPublication) Message() interface{} {
-	return r.message
+func (r *rpcMessage) Payload() interface{} {
+	return r.payload
+}
+
+func (r *rpcMessage) Header() map[string]string {
+	return r.header
+}
+
+func (r *rpcMessage) Body() []byte {
+	return r.body
+}
+
+func (r *rpcMessage) Codec() codec.Reader {
+	b := buf.New(bytes.NewBuffer(r.body))
+	return r.codec(b)
 }

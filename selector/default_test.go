@@ -1,19 +1,21 @@
 package selector
 
 import (
+	"os"
 	"testing"
 
-	"github.com/micro/go-micro/registry/mock"
+	"go-micro.dev/v6/registry"
 )
 
-func TestDefaultSelector(t *testing.T) {
+func TestRegistrySelector(t *testing.T) {
 	counts := map[string]int{}
 
-	rs := newDefaultSelector(Registry(mock.NewRegistry()))
+	r := registry.NewMemoryRegistry(registry.Services(testData))
+	cache := NewSelector(Registry(r))
 
-	next, err := rs.Select("foo")
+	next, err := cache.Select("foo")
 	if err != nil {
-		t.Errorf("Unexpected error calling default select: %v", err)
+		t.Errorf("Unexpected error calling cache select: %v", err)
 	}
 
 	for i := 0; i < 100; i++ {
@@ -24,5 +26,7 @@ func TestDefaultSelector(t *testing.T) {
 		counts[node.Id]++
 	}
 
-	t.Logf("Default Counts %v", counts)
+	if len(os.Getenv("IN_TRAVIS_CI")) == 0 {
+		t.Logf("Selector Counts %v", counts)
+	}
 }

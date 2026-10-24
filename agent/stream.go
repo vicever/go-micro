@@ -1,0 +1,359 @@
+package agent
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"io"
+	"strings"
+	"sync"
+	"sync/atomic"
+
+	"github.com/google/uuid"
+
+	"go-micro.dev/v6/model"
+)
+
+// StreamEventType identifies an event emitted by a tool-aware agent stream.
+type StreamEventType string
+
+const (
+	// StreamEventToolStart is emitted immediately before a tool call runs.
+	StreamEventToolStart StreamEventType = "tool_start"
+	// StreamEventToolOutput carries incremental command output.
+	StreamEventToolOutput StreamEventType = "tool_output"
+	// StreamEventApproval asks the connected client for a decision.
+	StreamEventApproval StreamEventType = "approval"
+	// StreamEventToolEnd is emitted after a tool call returns or is refused.
+	StreamEventToolEnd StreamEventType = "tool_end"
+	// StreamEventToken carries incremental text, including progress between tools.
+	StreamEventToken StreamEventType = "token"
+	// StreamEventDone carries the completed agent response.
+	StreamEventDone StreamEventType = "done"
+)
+
+// StreamEvent is one event from StreamAsk.
+type StreamEvent struct {
+	ApprovalID string
+	Type       StreamEventType
+	Token      string
+	ToolCall   model.ToolCall
+	Result     model.ToolResult
+	Response   *Response
+}
+
+// AgentStream carries incremental text and tool events, followed by a completed response.
+type AgentStream interface {
+	Recv() (*StreamEvent, error)
+	Close() error
+}
+
+// StreamAsk runs an agent Ask turn with tool start/end events and streams the final answer.
+// It is additive for callers that hold the public Agent interface; concrete agents also
+// expose the same method directly.
+func StreamAsk(ctx context.Context, ag Agent, message string) (AgentStream, error) {
+	streamer, ok := ag.(interface {
+		StreamAsk(context.Context, string) (AgentStream, error)
+	})
+	if !ok {
+		return nil, errors.New("agent: StreamAsk unsupported by implementation")
+	}
+	return streamer.StreamAsk(ctx, message)
+}
+
+// StreamResumer is the optional capability for resuming a run as a stream.
+type StreamResumer interface {
+	ResumeStreamAsk(context.Context, string) (AgentStream, error)
+}
+
+func (a *agentImpl) ResumeStreamAsk(ctx context.Context, runID string) (AgentStream, error) {
+	return a.resumeStreamAsk(ctx, runID)
+}
+
+// ResumeStreamAsk resumes a checkpointed agent run and emits the same event
+// shape as StreamAsk. Completed runs are streamed from the persisted response;
+// unfinished runs continue from their checkpoint and emit tool events for any
+// work that still needs to run. Tool calls already recorded as done in the
+// checkpoint are reused by the agent checkpoint wrapper and are not re-executed.
+func ResumeStreamAsk(ctx context.Context, ag Agent, runID string) (AgentStream, error) {
+	a, ok := ag.(StreamResumer)
+	if !ok {
+		return nil, errors.New("agent: ResumeStreamAsk unsupported by implementation")
+	}
+	return a.ResumeStreamAsk(ctx, runID)
+}
+
+// StreamAsk runs tools like Ask, emits ToolStart/ToolEnd events as they execute,
+// emits provider text as available, then finishes with a Done event.
+func (a *agentImpl) StreamAsk(ctx context.Context, message string) (AgentStream, error) {
+	streamCtx, cancel := context.WithCancel(ctx)
+	events := make(chan *StreamEvent, 16)
+	done := make(chan struct{})
+	s := &agentStream{events: events, done: done, cancel: cancel}
+
+	go func() {
+		defer close(events)
+		defer close(done)
+		var emitted atomic.Bool
+		resp, err := a.askWithStreamEvents(streamCtx, message, events, &emitted)
+		if err != nil {
+			s.setErr(err)
+			return
+		}
+		if !emitted.Load() && resp.Reply != "" {
+			if !sendStreamEvent(streamCtx, events, &StreamEvent{Type: StreamEventToken, Token: resp.Reply}) {
+				return
+			}
+		}
+		_ = sendStreamEvent(streamCtx, events, &StreamEvent{Type: StreamEventDone, Response: resp})
+	}()
+	return s, nil
+}
+
+func (a *agentImpl) resumeStreamAsk(ctx context.Context, runID string) (AgentStream, error) {
+	streamCtx, cancel := context.WithCancel(ctx)
+	events := make(chan *StreamEvent, 16)
+	done := make(chan struct{})
+	s := &agentStream{events: events, done: done, cancel: cancel}
+
+	go func() {
+		defer close(events)
+		defer close(done)
+		var emitted atomic.Bool
+		resp, err := a.resumeWithStreamEvents(streamCtx, runID, events, &emitted)
+		if err != nil {
+			s.setErr(err)
+			return
+		}
+		if !emitted.Load() && resp.Reply != "" {
+			if !sendStreamEvent(streamCtx, events, &StreamEvent{Type: StreamEventToken, Token: resp.Reply}) {
+				return
+			}
+		}
+		_ = sendStreamEvent(streamCtx, events, &StreamEvent{Type: StreamEventDone, Response: resp})
+	}()
+	return s, nil
+}
+
+func (a *agentImpl) askWithStreamEvents(ctx context.Context, message string, events chan<- *StreamEvent, emitted *atomic.Bool) (*Response, error) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+
+	if a.tools == nil {
+		a.tools = model.NewTools(a.opts.Registry, model.ToolClient(a.opts.Client))
+	}
+	send, stop := streamEvents(ctx, events)
+	defer stop()
+	ctx = context.WithValue(ctx, eventKey{}, send)
+	base := a.toolHandler()
+	handler := func(ctx context.Context, call model.ToolCall) model.ToolResult {
+		_ = send(&StreamEvent{Type: StreamEventToolStart, ToolCall: call})
+		result := base(ctx, call)
+		_ = send(&StreamEvent{Type: StreamEventToolEnd, ToolCall: call, Result: result})
+		return result
+	}
+	a.onToken = func(token string) {
+		if token != "" && send(&StreamEvent{Type: StreamEventToken, Token: token}) {
+			emitted.Store(true)
+		}
+	}
+	defer func() { a.onToken = nil }()
+	a.setupWithToolHandler(handler)
+	defer a.setupWithToolHandler(nil)
+	return a.askLocked(ctx, uuid.New().String(), message, a.parentRunID, nil, true)
+}
+
+func (a *agentImpl) resumeWithStreamEvents(ctx context.Context, runID string, events chan<- *StreamEvent, emitted *atomic.Bool) (*Response, error) {
+	if a.opts.Checkpoint == nil {
+		return nil, errors.New("agent: ResumeStreamAsk requires a checkpoint")
+	}
+	run, ok, err := a.opts.Checkpoint.Load(ctx, runID)
+	if err != nil {
+		return nil, err
+	}
+	if !ok {
+		return nil, errors.New("agent: checkpointed run not found")
+	}
+	if run.Status == "done" {
+		var resp Response
+		if err := json.Unmarshal(run.State.Data, &resp); err != nil {
+			return nil, err
+		}
+		return &resp, nil
+	}
+	if terminalAgentRunStatus(run.Status) {
+		return nil, &TerminalRunError{RunID: run.ID, Status: run.Status, message: "agent: checkpointed run is terminal with status " + run.Status}
+	}
+
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.tools == nil {
+		a.tools = model.NewTools(a.opts.Registry, model.ToolClient(a.opts.Client))
+	}
+	send, stop := streamEvents(ctx, events)
+	defer stop()
+	ctx = context.WithValue(ctx, eventKey{}, send)
+	base := a.toolHandler()
+	handler := func(ctx context.Context, call model.ToolCall) model.ToolResult {
+		_ = send(&StreamEvent{Type: StreamEventToolStart, ToolCall: call})
+		result := base(ctx, call)
+		_ = send(&StreamEvent{Type: StreamEventToolEnd, ToolCall: call, Result: result})
+		return result
+	}
+	a.onToken = func(token string) {
+		if token != "" && send(&StreamEvent{Type: StreamEventToken, Token: token}) {
+			emitted.Store(true)
+		}
+	}
+	defer func() { a.onToken = nil }()
+	a.setupWithToolHandler(handler)
+	defer a.setupWithToolHandler(nil)
+	if paused := pendingApproval(run); paused != nil {
+		return nil, paused
+	}
+	if run.Status == "paused" {
+		if run.State.Stage == agentInputStep {
+			return nil, &AwaitingInputError{RunID: run.ID, message: "agent: checkpointed run is input-required; resume with ResumeInput"}
+		}
+		run.Status = "running"
+		run.State.Stage = agentAskStep
+	}
+	return a.askLocked(ctx, run.ID, string(run.State.Data), run.ParentID, &run, false)
+}
+
+type agentStreamAdapter struct {
+	stream AgentStream
+}
+
+type memoryRecordingStream struct {
+	stream model.Stream
+	memory Memory
+
+	mu     sync.Mutex
+	chunks []string
+	closed bool
+}
+
+func (s *memoryRecordingStream) Recv() (*model.Response, error) {
+	resp, err := s.stream.Recv()
+	if resp != nil && resp.Reply != "" {
+		s.mu.Lock()
+		s.chunks = append(s.chunks, resp.Reply)
+		s.mu.Unlock()
+	}
+	if errors.Is(err, io.EOF) {
+		s.recordAssistant()
+	}
+	return resp, err
+}
+
+func (s *memoryRecordingStream) Close() error {
+	s.recordAssistant()
+	return s.stream.Close()
+}
+
+func (s *memoryRecordingStream) recordAssistant() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closed {
+		return
+	}
+	s.closed = true
+	if reply := strings.Join(s.chunks, ""); reply != "" {
+		s.memory.Add("assistant", reply)
+	}
+}
+
+func (s *agentStreamAdapter) Recv() (*model.Response, error) {
+	for {
+		event, err := s.stream.Recv()
+		if err != nil {
+			return nil, err
+		}
+		if event == nil {
+			continue
+		}
+		switch event.Type {
+		case StreamEventToken:
+			if event.Token == "" {
+				continue
+			}
+			return &model.Response{Reply: event.Token}, nil
+		case StreamEventDone:
+			return nil, io.EOF
+		}
+	}
+}
+
+func (s *agentStreamAdapter) Close() error {
+	return s.stream.Close()
+}
+
+func (a *agentImpl) streamAskAI(ctx context.Context, message string) (model.Stream, error) {
+	stream, err := a.StreamAsk(ctx, message)
+	if err != nil {
+		return nil, err
+	}
+	return &agentStreamAdapter{stream: stream}, nil
+}
+
+type agentStream struct {
+	events <-chan *StreamEvent
+	done   <-chan struct{}
+	cancel context.CancelFunc
+	mu     sync.Mutex
+	err    error
+}
+
+func (s *agentStream) Recv() (*StreamEvent, error) {
+	ev, ok := <-s.events
+	if ok {
+		return ev, nil
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.err != nil {
+		return nil, s.err
+	}
+	return nil, io.EOF
+}
+
+func (s *agentStream) Close() error {
+	if s.cancel != nil {
+		s.cancel()
+	}
+	<-s.done
+	return nil
+}
+
+func (s *agentStream) setErr(err error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.err = err
+}
+
+func sendStreamEvent(ctx context.Context, events chan<- *StreamEvent, ev *StreamEvent) bool {
+	select {
+	case events <- ev:
+		return true
+	case <-ctx.Done():
+		return false
+	}
+}
+
+// streamEvents stops late callbacks before the event channel is closed. A
+// provider may still be unwinding its tool handler after caller cancellation.
+func streamEvents(ctx context.Context, events chan<- *StreamEvent) (func(*StreamEvent) bool, func()) {
+	var mu sync.Mutex
+	closed := false
+	send := func(event *StreamEvent) bool {
+		mu.Lock()
+		defer mu.Unlock()
+		if closed {
+			return false
+		}
+		return sendStreamEvent(ctx, events, event)
+	}
+	stop := func() { mu.Lock(); closed = true; mu.Unlock() }
+	return send, stop
+}

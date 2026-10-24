@@ -1,35 +1,58 @@
 package client
 
 import (
-	"bytes"
+	"context"
 	"fmt"
 	"sync"
+	"sync/atomic"
 	"time"
 
-	"github.com/micro/go-micro/broker"
-	"github.com/micro/go-micro/codec"
-	"github.com/micro/go-micro/errors"
-	"github.com/micro/go-micro/metadata"
-	"github.com/micro/go-micro/selector"
-	"github.com/micro/go-micro/transport"
+	"github.com/google/uuid"
+	"github.com/pkg/errors"
 
-	"golang.org/x/net/context"
+	"go-micro.dev/v6/broker"
+	"go-micro.dev/v6/codec"
+	raw "go-micro.dev/v6/codec/bytes"
+	merrors "go-micro.dev/v6/errors"
+	"go-micro.dev/v6/internal/util/buf"
+	"go-micro.dev/v6/internal/util/net"
+	"go-micro.dev/v6/internal/util/pool"
+	log "go-micro.dev/v6/logger"
+	"go-micro.dev/v6/metadata"
+	"go-micro.dev/v6/registry"
+	"go-micro.dev/v6/selector"
+	"go-micro.dev/v6/transport"
+	"go-micro.dev/v6/transport/headers"
+)
+
+const (
+	packageID = "go.micro.client"
 )
 
 type rpcClient struct {
-	once sync.Once
+	seq  uint64
 	opts Options
-	pool *pool
+	once atomic.Value
+	pool pool.Pool
+	mu   sync.RWMutex
 }
 
-func newRpcClient(opt ...Option) Client {
-	opts := newOptions(opt...)
+func newRPCClient(opt ...Option) Client {
+	opts := NewOptions(opt...)
+
+	p := pool.NewPool(
+		pool.Size(opts.PoolSize),
+		pool.TTL(opts.PoolTTL),
+		pool.Transport(opts.Transport),
+		pool.CloseTimeout(opts.PoolCloseTimeout),
+	)
 
 	rc := &rpcClient{
-		once: sync.Once{},
 		opts: opts,
-		pool: newPool(opts.PoolSize, opts.PoolTTL),
+		pool: p,
+		seq:  0,
 	}
+	rc.once.Store(false)
 
 	c := Client(rc)
 
@@ -45,13 +68,30 @@ func (r *rpcClient) newCodec(contentType string) (codec.NewCodec, error) {
 	if c, ok := r.opts.Codecs[contentType]; ok {
 		return c, nil
 	}
-	if cf, ok := defaultCodecs[contentType]; ok {
+
+	if cf, ok := DefaultCodecs[contentType]; ok {
 		return cf, nil
 	}
-	return nil, fmt.Errorf("Unsupported Content-Type: %s", contentType)
+
+	return nil, fmt.Errorf("unsupported Content-Type: %s", contentType)
 }
 
-func (r *rpcClient) call(ctx context.Context, address string, req Request, resp interface{}, opts CallOptions) error {
+func (r *rpcClient) call(
+	ctx context.Context,
+	node *registry.Node,
+	req Request,
+	resp interface{},
+	opts CallOptions,
+) error {
+	// In-process fast-path: if the callee runs in this process and both bodies
+	// are raw frames, dispatch directly and skip the network entirely.
+	if handled, err := r.localCall(ctx, req, resp); handled {
+		return err
+	}
+
+	address := node.Address
+	logger := r.Options().Logger
+
 	msg := &transport.Message{
 		Header: make(map[string]string),
 	}
@@ -59,56 +99,116 @@ func (r *rpcClient) call(ctx context.Context, address string, req Request, resp 
 	md, ok := metadata.FromContext(ctx)
 	if ok {
 		for k, v := range md {
+			// Don't copy Micro-Topic header, that is used for pub/sub
+			// this is fixes the case when the client uses the same context that
+			// is received in the subscriber.
+			if k == headers.Message {
+				continue
+			}
+
 			msg.Header[k] = v
 		}
 	}
 
+	// Set connection timeout for single requests to the server. Should be > 0
+	// as otherwise requests can't be made.
+	cTimeout := opts.ConnectionTimeout
+	if cTimeout == 0 {
+		logger.Log(log.DebugLevel, "connection timeout was set to 0, overridng to default connection timeout")
+
+		cTimeout = DefaultConnectionTimeout
+	}
+
 	// set timeout in nanoseconds
-	msg.Header["Timeout"] = fmt.Sprintf("%d", opts.RequestTimeout)
+	msg.Header["Timeout"] = fmt.Sprintf("%d", cTimeout)
 	// set the content type for the request
 	msg.Header["Content-Type"] = req.ContentType()
 	// set the accept header
 	msg.Header["Accept"] = req.ContentType()
 
-	cf, err := r.newCodec(req.ContentType())
-	if err != nil {
-		return errors.InternalServerError("go.micro.client", err.Error())
+	// setup old protocol
+	reqCodec := setupProtocol(msg, node)
+
+	// no codec specified
+	if reqCodec == nil {
+		var err error
+		reqCodec, err = r.newCodec(req.ContentType())
+
+		if err != nil {
+			return merrors.InternalServerError("go.micro.client", err.Error())
+		}
 	}
 
-	var grr error
-	c, err := r.pool.getConn(address, r.opts.Transport, transport.WithTimeout(opts.DialTimeout))
-	if err != nil {
-		return errors.InternalServerError("go.micro.client", fmt.Sprintf("connection error: %v", err))
+	dOpts := []transport.DialOption{
+		transport.WithStream(),
 	}
-	defer func() {
-		// defer execution of release
-		r.pool.release(address, c, grr)
-	}()
+
+	if opts.DialTimeout >= 0 {
+		dOpts = append(dOpts, transport.WithTimeout(opts.DialTimeout))
+	}
+
+	if opts.ConnClose {
+		dOpts = append(dOpts, transport.WithConnClose())
+	}
+
+	c, err := r.pool.Get(address, dOpts...)
+	if err != nil {
+		if c == nil {
+			return merrors.InternalServerError("go.micro.client", "connection error: %v", err)
+		}
+		logger.Log(log.ErrorLevel, "failed to close pool", err)
+	}
+
+	seq := atomic.AddUint64(&r.seq, 1) - 1
+	codec := newRPCCodec(msg, c, reqCodec, "")
+
+	rsp := &rpcResponse{
+		socket: c,
+		codec:  codec,
+	}
+
+	releaseFunc := func(err error) {
+		if err = r.pool.Release(c, err); err != nil {
+			logger.Log(log.ErrorLevel, "failed to release pool", err)
+		}
+	}
 
 	stream := &rpcStream{
-		context: ctx,
-		request: req,
-		closed:  make(chan bool),
-		codec:   newRpcPlusCodec(msg, c, cf),
+		id:       fmt.Sprintf("%v", seq),
+		context:  ctx,
+		request:  req,
+		response: rsp,
+		codec:    codec,
+		closed:   make(chan bool),
+		close:    opts.ConnClose,
+		release:  releaseFunc,
+		sendEOS:  false,
 	}
-	defer stream.Close()
 
+	// close the stream on exiting this function
+	defer func() {
+		if err := stream.Close(); err != nil {
+			logger.Log(log.ErrorLevel, "failed to close stream", err)
+		}
+	}()
+
+	// wait for error response
 	ch := make(chan error, 1)
 
 	go func() {
 		defer func() {
 			if r := recover(); r != nil {
-				ch <- errors.InternalServerError("go.micro.client", fmt.Sprintf("panic recovered: %v", r))
+				ch <- merrors.InternalServerError("go.micro.client", "panic recovered: %v", r)
 			}
 		}()
 
 		// send request
-		if err := stream.Send(req.Request()); err != nil {
+		if err := stream.Send(req.Body()); err != nil {
 			ch <- err
 			return
 		}
 
-		// recv request
+		// recv response
 		if err := stream.Recv(resp); err != nil {
 			ch <- err
 			return
@@ -118,17 +218,31 @@ func (r *rpcClient) call(ctx context.Context, address string, req Request, resp 
 		ch <- nil
 	}()
 
+	var grr error
+
 	select {
 	case err := <-ch:
-		grr = err
 		return err
-	case <-ctx.Done():
-		grr = ctx.Err()
-		return errors.New("go.micro.client", fmt.Sprintf("request timeout: %v", ctx.Err()), 408)
+	case <-time.After(cTimeout):
+		grr = merrors.Timeout("go.micro.client", fmt.Sprintf("%v", ctx.Err()))
 	}
+
+	// set the stream error
+	if grr != nil {
+		stream.Lock()
+		stream.err = grr
+		stream.Unlock()
+
+		return grr
+	}
+
+	return nil
 }
 
-func (r *rpcClient) stream(ctx context.Context, address string, req Request, opts CallOptions) (Streamer, error) {
+func (r *rpcClient) stream(ctx context.Context, node *registry.Node, req Request, opts CallOptions) (Stream, error) {
+	address := node.Address
+	logger := r.Options().Logger
+
 	msg := &transport.Message{
 		Header: make(map[string]string),
 	}
@@ -141,33 +255,76 @@ func (r *rpcClient) stream(ctx context.Context, address string, req Request, opt
 	}
 
 	// set timeout in nanoseconds
-	msg.Header["Timeout"] = fmt.Sprintf("%d", opts.RequestTimeout)
+	if opts.StreamTimeout > time.Duration(0) {
+		msg.Header["Timeout"] = fmt.Sprintf("%d", opts.StreamTimeout)
+	}
 	// set the content type for the request
 	msg.Header["Content-Type"] = req.ContentType()
 	// set the accept header
 	msg.Header["Accept"] = req.ContentType()
 
-	cf, err := r.newCodec(req.ContentType())
-	if err != nil {
-		return nil, errors.InternalServerError("go.micro.client", err.Error())
+	// set old codecs
+	nCodec := setupProtocol(msg, node)
+
+	// no codec specified
+	if nCodec == nil {
+		var err error
+
+		nCodec, err = r.newCodec(req.ContentType())
+		if err != nil {
+			return nil, merrors.InternalServerError("go.micro.client", err.Error())
+		}
 	}
 
-	c, err := r.opts.Transport.Dial(address, transport.WithStream(), transport.WithTimeout(opts.DialTimeout))
+	dOpts := []transport.DialOption{
+		transport.WithStream(),
+	}
+
+	if opts.DialTimeout >= 0 {
+		dOpts = append(dOpts, transport.WithTimeout(opts.DialTimeout))
+	}
+
+	c, err := r.opts.Transport.Dial(address, dOpts...)
 	if err != nil {
-		return nil, errors.InternalServerError("go.micro.client", fmt.Sprintf("connection error: %v", err))
+		return nil, merrors.InternalServerError("go.micro.client", "connection error: %v", err)
+	}
+
+	// increment the sequence number
+	seq := atomic.AddUint64(&r.seq, 1) - 1
+	id := fmt.Sprintf("%v", seq)
+
+	// create codec with stream id
+	codec := newRPCCodec(msg, c, nCodec, id)
+
+	rsp := &rpcResponse{
+		socket: c,
+		codec:  codec,
+	}
+
+	// set request codec
+	if r, ok := req.(*rpcRequest); ok {
+		r.codec = codec
 	}
 
 	stream := &rpcStream{
-		context: ctx,
-		request: req,
-		closed:  make(chan bool),
-		codec:   newRpcPlusCodec(msg, c, cf),
+		id:       id,
+		context:  ctx,
+		request:  req,
+		response: rsp,
+		codec:    codec,
+		// used to close the stream
+		closed: make(chan bool),
+		// signal the end of stream,
+		sendEOS: true,
+		release: func(_ error) {},
 	}
 
+	// wait for error response
 	ch := make(chan error, 1)
 
 	go func() {
-		ch <- stream.Send(req.Request())
+		// send the first message
+		ch <- stream.Send(req.Body())
 	}()
 
 	var grr error
@@ -176,11 +333,20 @@ func (r *rpcClient) stream(ctx context.Context, address string, req Request, opt
 	case err := <-ch:
 		grr = err
 	case <-ctx.Done():
-		grr = errors.New("go.micro.client", fmt.Sprintf("request timeout: %v", ctx.Err()), 408)
+		grr = merrors.Timeout("go.micro.client", fmt.Sprintf("%v", ctx.Err()))
 	}
 
 	if grr != nil {
-		stream.Close()
+		// set the error
+		stream.Lock()
+		stream.err = grr
+		stream.Unlock()
+
+		// close the stream
+		if err := stream.Close(); err != nil {
+			logger.Logf(log.ErrorLevel, "failed to close stream: %v", err)
+		}
+
 		return nil, grr
 	}
 
@@ -188,65 +354,106 @@ func (r *rpcClient) stream(ctx context.Context, address string, req Request, opt
 }
 
 func (r *rpcClient) Init(opts ...Option) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
 	size := r.opts.PoolSize
 	ttl := r.opts.PoolTTL
+	tr := r.opts.Transport
 
 	for _, o := range opts {
 		o(&r.opts)
 	}
 
-	// recreate the pool if the options changed
-	if size != r.opts.PoolSize || ttl != r.opts.PoolTTL {
-		r.pool = newPool(r.opts.PoolSize, r.opts.PoolTTL)
+	// update pool configuration if the options changed
+	if size != r.opts.PoolSize || ttl != r.opts.PoolTTL || tr != r.opts.Transport {
+		// close existing pool
+		if err := r.pool.Close(); err != nil {
+			return errors.Wrap(err, "failed to close pool")
+		}
+
+		// create new pool
+		r.pool = pool.NewPool(
+			pool.Size(r.opts.PoolSize),
+			pool.TTL(r.opts.PoolTTL),
+			pool.Transport(r.opts.Transport),
+			pool.CloseTimeout(r.opts.PoolCloseTimeout),
+		)
 	}
 
 	return nil
 }
 
+// Options retrives the options.
 func (r *rpcClient) Options() Options {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+
 	return r.opts
 }
 
-func (r *rpcClient) CallRemote(ctx context.Context, address string, request Request, response interface{}, opts ...CallOption) error {
-	// make a copy of call opts
-	callOpts := r.opts.CallOptions
-	for _, opt := range opts {
-		opt(&callOpts)
-	}
-	return r.call(ctx, address, request, response, callOpts)
-}
+// next returns an iterator for the next nodes to call.
+func (r *rpcClient) next(request Request, opts CallOptions) (selector.Next, error) {
+	// try get the proxy
+	service, address, _ := net.Proxy(request.Service(), opts.Address)
 
-func (r *rpcClient) Call(ctx context.Context, request Request, response interface{}, opts ...CallOption) error {
-	// make a copy of call opts
-	callOpts := r.opts.CallOptions
-	for _, opt := range opts {
-		opt(&callOpts)
+	// return remote address
+	if len(address) > 0 {
+		nodes := make([]*registry.Node, len(address))
+
+		for i, addr := range address {
+			nodes[i] = &registry.Node{
+				Address: addr,
+				// Set the protocol
+				Metadata: map[string]string{
+					"protocol": "mucp",
+				},
+			}
+		}
+
+		// crude return method
+		return func() (*registry.Node, error) {
+			return nodes[time.Now().Unix()%int64(len(nodes))], nil
+		}, nil
 	}
 
 	// get next nodes from the selector
-	next, err := r.opts.Selector.Select(request.Service(), callOpts.SelectOptions...)
-	if err != nil && err == selector.ErrNotFound {
-		return errors.NotFound("go.micro.client", err.Error())
-	} else if err != nil {
-		return errors.InternalServerError("go.micro.client", err.Error())
+	next, err := r.opts.Selector.Select(service, opts.SelectOptions...)
+	if err != nil {
+		return nil, NewDiscoveryError(service, err)
 	}
 
-	// check if we already have a deadline
-	d, ok := ctx.Deadline()
-	if !ok {
-		// no deadline so we create a new one
-		ctx, _ = context.WithTimeout(ctx, callOpts.RequestTimeout)
-	} else {
-		// got a deadline so no need to setup context
-		// but we need to set the timeout we pass along
-		opt := WithRequestTimeout(d.Sub(time.Now()))
-		opt(&callOpts)
+	return next, nil
+}
+
+func (r *rpcClient) Call(ctx context.Context, request Request, response interface{}, opts ...CallOption) error {
+	// TODO: further validate these mutex locks. full lock would prevent
+	// parallel calls. Maybe we can set individual locks for secctions.
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+
+	// make a copy of call opts
+	callOpts := ResolveCallOptions(r.opts, request, opts...)
+
+	next, err := r.next(request, callOpts)
+	if err != nil {
+		return err
+	}
+
+	// The request budget and caller deadline both apply; the earlier wins.
+	if callOpts.RequestTimeout > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, callOpts.RequestTimeout)
+		defer cancel()
+	}
+	if deadline, ok := ctx.Deadline(); ok {
+		callOpts.RequestTimeout = time.Until(deadline)
 	}
 
 	// should we noop right here?
 	select {
 	case <-ctx.Done():
-		return errors.New("go.micro.client", fmt.Sprintf("%v", ctx.Err()), 408)
+		return merrors.Timeout("go.micro.client", fmt.Sprintf("%v", ctx.Err()))
 	default:
 	}
 
@@ -263,7 +470,7 @@ func (r *rpcClient) Call(ctx context.Context, request Request, response interfac
 		// call backoff first. Someone may want an initial start delay
 		t, err := callOpts.Backoff(ctx, request, i)
 		if err != nil {
-			return errors.InternalServerError("go.micro.client", err.Error())
+			return merrors.InternalServerError("go.micro.client", "backoff error: %v", err.Error())
 		}
 
 		// only sleep if greater than 0
@@ -273,35 +480,40 @@ func (r *rpcClient) Call(ctx context.Context, request Request, response interfac
 
 		// select next node
 		node, err := next()
-		if err != nil && err == selector.ErrNotFound {
-			return errors.NotFound("go.micro.client", err.Error())
-		} else if err != nil {
-			return errors.InternalServerError("go.micro.client", err.Error())
-		}
+		service := request.Service()
 
-		// set the address
-		address := node.Address
-		if node.Port > 0 {
-			address = fmt.Sprintf("%s:%d", address, node.Port)
+		if err != nil {
+			return NewDiscoveryError(service, err)
 		}
 
 		// make the call
-		err = rcall(ctx, address, request, response, callOpts)
-		r.opts.Selector.Mark(request.Service(), node, err)
+		err = rcall(ctx, node, request, response, callOpts)
+		r.opts.Selector.Mark(service, node, err)
+
 		return err
 	}
 
-	ch := make(chan error, callOpts.Retries)
+	// get the retries
+	retries := callOpts.Retries
+
+	// disable retries when using a proxy
+	// Note: I don't see why we should disable retries for proxies, so commenting out.
+	// if _, _, ok := net.Proxy(request.Service(), callOpts.Address); ok {
+	// 	retries = 0
+	// }
+
+	ch := make(chan error, retries+1)
+
 	var gerr error
 
-	for i := 0; i < callOpts.Retries; i++ {
-		go func() {
+	for i := 0; i <= retries; i++ {
+		go func(i int) {
 			ch <- call(i)
-		}()
+		}(i)
 
 		select {
 		case <-ctx.Done():
-			return errors.New("go.micro.client", fmt.Sprintf("call timeout: %v", ctx.Err()), 408)
+			return merrors.Timeout("go.micro.client", fmt.Sprintf("call timeout: %v", ctx.Err()))
 		case err := <-ch:
 			// if the call succeeded lets bail early
 			if err == nil {
@@ -317,6 +529,8 @@ func (r *rpcClient) Call(ctx context.Context, request Request, response interfac
 				return err
 			}
 
+			r.opts.Logger.Logf(log.DebugLevel, "Retrying request. Previous attempt failed with: %v", err)
+
 			gerr = err
 		}
 	}
@@ -324,54 +538,29 @@ func (r *rpcClient) Call(ctx context.Context, request Request, response interfac
 	return gerr
 }
 
-func (r *rpcClient) StreamRemote(ctx context.Context, address string, request Request, opts ...CallOption) (Streamer, error) {
+func (r *rpcClient) Stream(ctx context.Context, request Request, opts ...CallOption) (Stream, error) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+
 	// make a copy of call opts
-	callOpts := r.opts.CallOptions
-	for _, opt := range opts {
-		opt(&callOpts)
-	}
-	return r.stream(ctx, address, request, callOpts)
-}
+	callOpts := ResolveCallOptions(r.opts, request, opts...)
 
-func (r *rpcClient) Stream(ctx context.Context, request Request, opts ...CallOption) (Streamer, error) {
-	// make a copy of call opts
-	callOpts := r.opts.CallOptions
-	for _, opt := range opts {
-		opt(&callOpts)
+	next, err := r.next(request, callOpts)
+	if err != nil {
+		return nil, err
 	}
 
-	// get next nodes from the selector
-	next, err := r.opts.Selector.Select(request.Service(), callOpts.SelectOptions...)
-	if err != nil && err == selector.ErrNotFound {
-		return nil, errors.NotFound("go.micro.client", err.Error())
-	} else if err != nil {
-		return nil, errors.InternalServerError("go.micro.client", err.Error())
-	}
-
-	// check if we already have a deadline
-	d, ok := ctx.Deadline()
-	if !ok {
-		// no deadline so we create a new one
-		ctx, _ = context.WithTimeout(ctx, callOpts.RequestTimeout)
-	} else {
-		// got a deadline so no need to setup context
-		// but we need to set the timeout we pass along
-		opt := WithRequestTimeout(d.Sub(time.Now()))
-		opt(&callOpts)
-	}
-
-	// should we noop right here?
 	select {
 	case <-ctx.Done():
-		return nil, errors.New("go.micro.client", fmt.Sprintf("%v", ctx.Err()), 408)
+		return nil, merrors.Timeout("go.micro.client", fmt.Sprintf("%v", ctx.Err()))
 	default:
 	}
 
-	call := func(i int) (Streamer, error) {
+	call := func(i int) (Stream, error) {
 		// call backoff first. Someone may want an initial start delay
 		t, err := callOpts.Backoff(ctx, request, i)
 		if err != nil {
-			return nil, errors.InternalServerError("go.micro.client", err.Error())
+			return nil, merrors.InternalServerError("go.micro.client", "backoff error: %v", err.Error())
 		}
 
 		// only sleep if greater than 0
@@ -380,39 +569,44 @@ func (r *rpcClient) Stream(ctx context.Context, request Request, opts ...CallOpt
 		}
 
 		node, err := next()
-		if err != nil && err == selector.ErrNotFound {
-			return nil, errors.NotFound("go.micro.client", err.Error())
-		} else if err != nil {
-			return nil, errors.InternalServerError("go.micro.client", err.Error())
+		service := request.Service()
+
+		if err != nil {
+			return nil, NewDiscoveryError(service, err)
 		}
 
-		address := node.Address
-		if node.Port > 0 {
-			address = fmt.Sprintf("%s:%d", address, node.Port)
-		}
+		stream, err := r.stream(ctx, node, request, callOpts)
+		r.opts.Selector.Mark(service, node, err)
 
-		stream, err := r.stream(ctx, address, request, callOpts)
-		r.opts.Selector.Mark(request.Service(), node, err)
 		return stream, err
 	}
 
 	type response struct {
-		stream Streamer
+		stream Stream
 		err    error
 	}
 
-	ch := make(chan response, callOpts.Retries)
+	// get the retries
+	retries := callOpts.Retries
+
+	// disable retries when using a proxy
+	if _, _, ok := net.Proxy(request.Service(), callOpts.Address); ok {
+		retries = 0
+	}
+
+	ch := make(chan response, retries+1)
+
 	var grr error
 
-	for i := 0; i < callOpts.Retries; i++ {
-		go func() {
+	for i := 0; i <= retries; i++ {
+		go func(i int) {
 			s, err := call(i)
 			ch <- response{s, err}
-		}()
+		}(i)
 
 		select {
 		case <-ctx.Done():
-			return nil, errors.New("go.micro.client", fmt.Sprintf("call timeout: %v", ctx.Err()), 408)
+			return nil, merrors.Timeout("go.micro.client", fmt.Sprintf("call timeout: %v", ctx.Err()))
 		case rsp := <-ch:
 			// if the call succeeded lets bail early
 			if rsp.err == nil {
@@ -435,51 +629,88 @@ func (r *rpcClient) Stream(ctx context.Context, request Request, opts ...CallOpt
 	return nil, grr
 }
 
-func (r *rpcClient) Publish(ctx context.Context, p Publication, opts ...PublishOption) error {
-	md, ok := metadata.FromContext(ctx)
-	if !ok {
-		md = make(map[string]string)
+func (r *rpcClient) Publish(ctx context.Context, msg Message, opts ...PublishOption) error {
+	options := PublishOptions{
+		Context: context.Background(),
 	}
-	md["Content-Type"] = p.ContentType()
+	for _, o := range opts {
+		o(&options)
+	}
+
+	metadata, ok := metadata.FromContext(ctx)
+	if !ok {
+		metadata = make(map[string]string)
+	}
+
+	id := uuid.New().String()
+	metadata["Content-Type"] = msg.ContentType()
+	metadata[headers.Message] = msg.Topic()
+	metadata[headers.ID] = id
+
+	// set the topic
+	topic := msg.Topic()
+
+	// get the exchange
+	if len(options.Exchange) > 0 {
+		topic = options.Exchange
+	}
 
 	// encode message body
-	cf, err := r.newCodec(p.ContentType())
+	cf, err := r.newCodec(msg.ContentType())
 	if err != nil {
-		return errors.InternalServerError("go.micro.client", err.Error())
+		return merrors.InternalServerError(packageID, err.Error())
 	}
-	b := &buffer{bytes.NewBuffer(nil)}
-	if err := cf(b).Write(&codec.Message{Type: codec.Publication}, p.Message()); err != nil {
-		return errors.InternalServerError("go.micro.client", err.Error())
+
+	var body []byte
+
+	// passed in raw data
+	if d, ok := msg.Payload().(*raw.Frame); ok {
+		body = d.Data
+	} else {
+		b := buf.New(nil)
+
+		if err = cf(b).Write(&codec.Message{
+			Target: topic,
+			Type:   codec.Event,
+			Header: map[string]string{
+				headers.ID:      id,
+				headers.Message: msg.Topic(),
+			},
+		}, msg.Payload()); err != nil {
+			return merrors.InternalServerError(packageID, err.Error())
+		}
+
+		// set the body
+		body = b.Bytes()
 	}
-	r.once.Do(func() {
-		r.opts.Broker.Connect()
-	})
 
-	return r.opts.Broker.Publish(p.Topic(), &broker.Message{
-		Header: md,
-		Body:   b.Bytes(),
-	})
+	l, ok := r.once.Load().(bool)
+	if !ok {
+		return fmt.Errorf("failed to cast to bool")
+	}
+
+	if !l {
+		if err = r.opts.Broker.Connect(); err != nil {
+			return merrors.InternalServerError(packageID, err.Error())
+		}
+
+		r.once.Store(true)
+	}
+
+	return r.opts.Broker.Publish(topic, &broker.Message{
+		Header: metadata,
+		Body:   body,
+	}, broker.PublishContext(options.Context))
 }
 
-func (r *rpcClient) NewPublication(topic string, message interface{}) Publication {
-	return newRpcPublication(topic, message, r.opts.ContentType)
+func (r *rpcClient) NewMessage(topic string, message interface{}, opts ...MessageOption) Message {
+	return newMessage(topic, message, r.opts.ContentType, opts...)
 }
 
-func (r *rpcClient) NewProtoPublication(topic string, message interface{}) Publication {
-	return newRpcPublication(topic, message, "application/octet-stream")
-}
 func (r *rpcClient) NewRequest(service, method string, request interface{}, reqOpts ...RequestOption) Request {
-	return newRpcRequest(service, method, request, r.opts.ContentType, reqOpts...)
-}
-
-func (r *rpcClient) NewProtoRequest(service, method string, request interface{}, reqOpts ...RequestOption) Request {
-	return newRpcRequest(service, method, request, "application/octet-stream", reqOpts...)
-}
-
-func (r *rpcClient) NewJsonRequest(service, method string, request interface{}, reqOpts ...RequestOption) Request {
-	return newRpcRequest(service, method, request, "application/json", reqOpts...)
+	return newRequest(service, method, request, r.opts.ContentType, reqOpts...)
 }
 
 func (r *rpcClient) String() string {
-	return "rpc"
+	return "mucp"
 }

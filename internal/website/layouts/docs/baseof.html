@@ -1,0 +1,25 @@
+<!doctype html>
+<html lang="{{ .Site.Language.Lang }}" class="no-js">
+  <head>{{ partial "head.html" . }}</head>
+  <body class="td-{{ .Kind }} micro-docs">
+    <header>{{ partial "navbar.html" . }}</header>
+    <div class="micro-docs-layout">
+      <nav class="micro-docs-nav" aria-label="Documentation">
+        {{ range .Site.Data.docs }}
+          {{ with $.Site.GetPage .path }}
+            <a href="{{ .RelPermalink }}"{{ if eq $.RelPermalink .RelPermalink }} aria-current="page"{{ end }}>{{ .Title }}</a>
+          {{ end }}
+        {{ end }}
+      </nav>
+      <main id="main-content" class="micro-docs-content">
+        {{ if not .Params.docs_main }}
+          <p class="micro-docs-archive">Older documentation. <a href="{{ "docs/quickstart.html" | relURL }}">Start with the current guides.</a></p>
+        {{ end }}
+        <h1>{{ .Title }}</h1>
+        {{ .Content }}
+      </main>
+    </div>
+    {{ partial "footer.html" . }}
+    {{ partial "scripts.html" . }}
+  </body>
+</html>

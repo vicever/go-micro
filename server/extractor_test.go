@@ -1,11 +1,11 @@
 package server
 
 import (
+	"context"
 	"reflect"
 	"testing"
 
-	"github.com/micro/go-micro/registry"
-	"golang.org/x/net/context"
+	"go-micro.dev/v6/registry"
 )
 
 type testHandler struct{}
@@ -61,5 +61,4 @@ func TestExtractEndpoint(t *testing.T) {
 	if endpoints[0].Response.Type != "testResponse" {
 		t.Errorf("Expected testResponse type got %s", endpoints[0].Response.Type)
 	}
-
 }

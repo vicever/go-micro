@@ -1,10 +1,23 @@
 package server
 
 import (
-	"golang.org/x/net/context"
+	"context"
+	"sync"
 )
 
 type serverKey struct{}
+type wgKey struct{}
+
+func wait(ctx context.Context) *sync.WaitGroup {
+	if ctx == nil {
+		return nil
+	}
+	wg, ok := ctx.Value(wgKey{}).(*sync.WaitGroup)
+	if !ok {
+		return nil
+	}
+	return wg
+}
 
 func FromContext(ctx context.Context) (Server, bool) {
 	c, ok := ctx.Value(serverKey{}).(Server)

@@ -1,0 +1,235 @@
+package config
+
+import (
+	"errors"
+	"fmt"
+	"os"
+	"path/filepath"
+	"runtime"
+	"strings"
+	"sync"
+	"testing"
+	"time"
+
+	"go-micro.dev/v6/config/loader"
+	loadermemory "go-micro.dev/v6/config/loader/memory"
+	"go-micro.dev/v6/config/source"
+	"go-micro.dev/v6/config/source/env"
+	"go-micro.dev/v6/config/source/file"
+	"go-micro.dev/v6/config/source/memory"
+)
+
+type closeTrackingLoader struct {
+	loader.Loader
+	err   error
+	calls int
+}
+
+func (l *closeTrackingLoader) Close() error {
+	l.calls++
+	return l.err
+}
+
+func createFileForIssue18(t *testing.T, content string) *os.File {
+	data := []byte(content)
+	path := filepath.Join(os.TempDir(), fmt.Sprintf("file.%d", time.Now().UnixNano()))
+	fh, err := os.Create(path)
+	if err != nil {
+		t.Error(err)
+	}
+	_, err = fh.Write(data)
+	if err != nil {
+		t.Error(err)
+	}
+
+	return fh
+}
+
+func createFileForTest(t *testing.T) *os.File {
+	data := []byte(`{"foo": "bar"}`)
+	path := filepath.Join(os.TempDir(), fmt.Sprintf("file.%d", time.Now().UnixNano()))
+	fh, err := os.Create(path)
+	if err != nil {
+		t.Error(err)
+	}
+	_, err = fh.Write(data)
+	if err != nil {
+		t.Error(err)
+	}
+
+	return fh
+}
+
+func TestConfigCloseConcurrentIdempotent(t *testing.T) {
+	conf, err := NewConfig(WithWatcherDisabled())
+	if err != nil {
+		t.Fatalf("Expected no error but got %v", err)
+	}
+
+	const goroutines = 64
+	var wg sync.WaitGroup
+	wg.Add(goroutines)
+	for i := 0; i < goroutines; i++ {
+		go func() {
+			defer wg.Done()
+			if err := conf.Close(); err != nil {
+				t.Errorf("Expected close to be idempotent but got %v", err)
+			}
+		}()
+	}
+	wg.Wait()
+
+	if err := conf.Close(); err != nil {
+		t.Fatalf("Expected repeated close to be idempotent but got %v", err)
+	}
+}
+
+func TestConfigCloseClosesLoader(t *testing.T) {
+	wantErr := errors.New("loader close failed")
+	l := &closeTrackingLoader{
+		Loader: loadermemory.NewLoader(loadermemory.WithWatcherDisabled()),
+		err:    wantErr,
+	}
+	conf, err := NewConfig(WithLoader(l), WithWatcherDisabled())
+	if err != nil {
+		t.Fatalf("Expected no error but got %v", err)
+	}
+
+	if err := conf.Close(); !errors.Is(err, wantErr) {
+		t.Fatalf("Expected loader close error %v but got %v", wantErr, err)
+	}
+	if err := conf.Close(); err != nil {
+		t.Fatalf("Expected repeated close to be idempotent but got %v", err)
+	}
+	if l.calls != 1 {
+		t.Fatalf("Expected loader to be closed once but got %d calls", l.calls)
+	}
+}
+
+func TestConfigLoadWithGoodFile(t *testing.T) {
+	fh := createFileForTest(t)
+	path := fh.Name()
+	defer func() {
+		fh.Close()
+		os.Remove(path)
+	}()
+
+	// Create new config
+	conf, err := NewConfig()
+	if err != nil {
+		t.Fatalf("Expected no error but got %v", err)
+	}
+	// Load file source
+	if err := conf.Load(file.NewSource(
+		file.WithPath(path),
+	)); err != nil {
+		t.Fatalf("Expected no error but got %v", err)
+	}
+}
+
+func TestConfigLoadWithInvalidFile(t *testing.T) {
+	fh := createFileForTest(t)
+	path := fh.Name()
+	defer func() {
+		fh.Close()
+		os.Remove(path)
+	}()
+
+	// Create new config
+	conf, err := NewConfig()
+	if err != nil {
+		t.Fatalf("Expected no error but got %v", err)
+	}
+	// Load file source
+	err = conf.Load(file.NewSource(
+		file.WithPath(path),
+		file.WithPath("/i/do/not/exists.json"),
+	))
+
+	if err == nil {
+		t.Fatal("Expected error but none !")
+	}
+	if !strings.Contains(fmt.Sprintf("%v", err), "/i/do/not/exists.json") {
+		t.Fatalf("Expected error to contain the unexisting file but got %v", err)
+	}
+}
+
+func TestConfigMerge(t *testing.T) {
+	fh := createFileForIssue18(t, `{
+  "amqp": {
+    "host": "rabbit.platform",
+    "port": 80
+  },
+  "handler": {
+    "exchange": "springCloudBus"
+  }
+}`)
+	path := fh.Name()
+	defer func() {
+		fh.Close()
+		os.Remove(path)
+	}()
+	os.Setenv("AMQP_HOST", "rabbit.testing.com")
+
+	conf, err := NewConfig()
+	if err != nil {
+		t.Fatalf("Expected no error but got %v", err)
+	}
+	if err := conf.Load(
+		file.NewSource(
+			file.WithPath(path),
+		),
+		env.NewSource(),
+	); err != nil {
+		t.Fatalf("Expected no error but got %v", err)
+	}
+
+	actualHost, err := conf.Get("amqp", "host")
+	if err != nil {
+		t.Fatal(err)
+	}
+	host := actualHost.String("backup")
+	if host != "rabbit.testing.com" {
+		t.Fatalf("Expected %v but got %v",
+			"rabbit.testing.com",
+			host)
+	}
+}
+
+func equalS(t *testing.T, actual, expect string) {
+	if actual != expect {
+		t.Errorf("Expected %s but got %s", actual, expect)
+	}
+}
+
+func TestConfigWatcherDirtyOverrite(t *testing.T) {
+	n := runtime.GOMAXPROCS(0)
+	defer runtime.GOMAXPROCS(n)
+
+	runtime.GOMAXPROCS(1)
+
+	l := 100
+
+	ss := make([]source.Source, l)
+
+	for i := 0; i < l; i++ {
+		ss[i] = memory.NewSource(memory.WithJSON([]byte(fmt.Sprintf(`{"key%d": "val%d"}`, i, i))))
+	}
+
+	conf, _ := NewConfig()
+
+	for _, s := range ss {
+		_ = conf.Load(s)
+	}
+	runtime.Gosched()
+
+	for i := range ss {
+		k := fmt.Sprintf("key%d", i)
+		v := fmt.Sprintf("val%d", i)
+		cc, err := conf.Get(k)
+		if err != nil {
+			t.Fatal(err)
+		}
+		equalS(t, cc.String(""), v)
+	}
+}

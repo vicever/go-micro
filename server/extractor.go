@@ -5,7 +5,7 @@ import (
 	"reflect"
 	"strings"
 
-	"github.com/micro/go-micro/registry"
+	"go-micro.dev/v6/registry"
 )
 
 func extractValue(v reflect.Type, d int) *registry.Value {
@@ -16,7 +16,7 @@ func extractValue(v reflect.Type, d int) *registry.Value {
 		return nil
 	}
 
-	if v.Kind() == reflect.Ptr {
+	if v.Kind() == reflect.Pointer {
 		v = v.Elem()
 	}
 
@@ -29,6 +29,9 @@ func extractValue(v reflect.Type, d int) *registry.Value {
 	case reflect.Struct:
 		for i := 0; i < v.NumField(); i++ {
 			f := v.Field(i)
+			if f.PkgPath != "" {
+				continue
+			}
 			val := extractValue(f.Type, d+1)
 			if val == nil {
 				continue
@@ -37,7 +40,12 @@ func extractValue(v reflect.Type, d int) *registry.Value {
 			// if we can find a json tag use it
 			if tags := f.Tag.Get("json"); len(tags) > 0 {
 				parts := strings.Split(tags, ",")
+				if parts[0] == "-" || parts[0] == "omitempty" {
+					continue
+				}
 				val.Name = parts[0]
+			} else {
+				val.Name = f.Name
 			}
 
 			// if there's no name default it
@@ -45,18 +53,19 @@ func extractValue(v reflect.Type, d int) *registry.Value {
 				val.Name = v.Field(i).Name
 			}
 
+			// still no name then continue
+			if len(val.Name) == 0 {
+				continue
+			}
+
 			arg.Values = append(arg.Values, val)
 		}
 	case reflect.Slice:
 		p := v.Elem()
-		if p.Kind() == reflect.Ptr {
+		if p.Kind() == reflect.Pointer {
 			p = p.Elem()
 		}
 		arg.Type = "[]" + p.Name()
-		val := extractValue(v.Elem(), d+1)
-		if val != nil {
-			arg.Values = append(arg.Values, val)
-		}
 	}
 
 	return arg
@@ -91,14 +100,21 @@ func extractEndpoint(method reflect.Method) *registry.Endpoint {
 	request := extractValue(reqType, 0)
 	response := extractValue(rspType, 0)
 
-	return &registry.Endpoint{
+	ep := &registry.Endpoint{
 		Name:     method.Name,
 		Request:  request,
 		Response: response,
-		Metadata: map[string]string{
-			"stream": fmt.Sprintf("%v", stream),
-		},
+		Metadata: make(map[string]string),
 	}
+
+	// set endpoint metadata for stream
+	if stream {
+		ep.Metadata = map[string]string{
+			"stream": fmt.Sprintf("%v", stream),
+		}
+	}
+
+	return ep
 }
 
 func extractSubValue(typ reflect.Type) *registry.Value {

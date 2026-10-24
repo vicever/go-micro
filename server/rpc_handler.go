@@ -3,17 +3,17 @@ package server
 import (
 	"reflect"
 
-	"github.com/micro/go-micro/registry"
+	"go-micro.dev/v6/registry"
 )
 
-type rpcHandler struct {
-	name      string
+type RpcHandler struct {
 	handler   interface{}
-	endpoints []*registry.Endpoint
 	opts      HandlerOptions
+	name      string
+	endpoints []*registry.Endpoint
 }
 
-func newRpcHandler(handler interface{}, opts ...HandlerOption) Handler {
+func NewRpcHandler(handler interface{}, opts ...HandlerOption) Handler {
 	options := HandlerOptions{
 		Metadata: make(map[string]map[string]string),
 	}
@@ -25,6 +25,24 @@ func newRpcHandler(handler interface{}, opts ...HandlerOption) Handler {
 	typ := reflect.TypeOf(handler)
 	hdlr := reflect.ValueOf(handler)
 	name := reflect.Indirect(hdlr).Type().Name()
+
+	// Auto-extract documentation from Go doc comments
+	autoMetadata := extractHandlerDocs(handler)
+
+	// Merge auto-extracted metadata with manually provided metadata
+	// Manual metadata takes precedence over auto-extracted
+	for endpoint, meta := range autoMetadata {
+		fullName := name + "." + endpoint
+		if options.Metadata[fullName] == nil {
+			options.Metadata[fullName] = make(map[string]string)
+		}
+		// Only add auto-extracted values if not manually provided
+		for k, v := range meta {
+			if _, exists := options.Metadata[fullName][k]; !exists {
+				options.Metadata[fullName][k] = v
+			}
+		}
+	}
 
 	var endpoints []*registry.Endpoint
 
@@ -40,7 +58,7 @@ func newRpcHandler(handler interface{}, opts ...HandlerOption) Handler {
 		}
 	}
 
-	return &rpcHandler{
+	return &RpcHandler{
 		name:      name,
 		handler:   handler,
 		endpoints: endpoints,
@@ -48,18 +66,18 @@ func newRpcHandler(handler interface{}, opts ...HandlerOption) Handler {
 	}
 }
 
-func (r *rpcHandler) Name() string {
+func (r *RpcHandler) Name() string {
 	return r.name
 }
 
-func (r *rpcHandler) Handler() interface{} {
+func (r *RpcHandler) Handler() interface{} {
 	return r.handler
 }
 
-func (r *rpcHandler) Endpoints() []*registry.Endpoint {
+func (r *RpcHandler) Endpoints() []*registry.Endpoint {
 	return r.endpoints
 }
 
-func (r *rpcHandler) Options() HandlerOptions {
+func (r *RpcHandler) Options() HandlerOptions {
 	return r.opts
 }

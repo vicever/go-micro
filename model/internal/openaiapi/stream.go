@@ -1,0 +1,124 @@
+package openaiapi
+
+import (
+	"bufio"
+	"bytes"
+	"context"
+	"encoding/json"
+	"fmt"
+	"io"
+	"net/http"
+	"strings"
+
+	"go-micro.dev/v6/model"
+)
+
+// Stream opens an OpenAI-compatible chat completions SSE stream.
+func Stream(ctx context.Context, opts model.Options, req *model.Request, basePath string) (model.Stream, error) {
+	return StreamWithRequest(ctx, opts, req, basePath, nil)
+}
+
+// StreamWithRequest applies provider-specific parameters before serialization.
+func StreamWithRequest(ctx context.Context, opts model.Options, req *model.Request, basePath string, prepare func(map[string]any)) (model.Stream, error) {
+	apiReq := Request(opts, Messages(req), nil)
+	if prepare != nil {
+		prepare(apiReq)
+	}
+	apiReq["stream"] = true
+	apiReq["stream_options"] = map[string]any{"include_usage": true}
+	reqBody, err := json.Marshal(apiReq)
+	if err != nil {
+		return nil, fmt.Errorf("failed to marshal stream request: %w", err)
+	}
+	apiURL := strings.TrimRight(opts.BaseURL, "/") + basePath
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, apiURL, bytes.NewReader(reqBody))
+	if err != nil {
+		return nil, fmt.Errorf("failed to create stream request: %w", err)
+	}
+	httpReq.Header.Set("Content-Type", "application/json")
+	httpReq.Header.Set("Accept", "text/event-stream")
+	// Keyless gateways (a LiteLLM proxy without a master key) take no auth header.
+	if opts.APIKey != "" {
+		httpReq.Header.Set("Authorization", "Bearer "+opts.APIKey)
+	}
+
+	httpResp, err := http.DefaultClient.Do(httpReq)
+	if err != nil {
+		return nil, fmt.Errorf("stream API request failed: %w", err)
+	}
+	if httpResp.StatusCode != http.StatusOK {
+		defer httpResp.Body.Close()
+		respBody, _ := io.ReadAll(httpResp.Body)
+		return nil, fmt.Errorf("stream API error (%s): %s", httpResp.Status, string(respBody))
+	}
+	return &StreamReader{body: httpResp.Body, scanner: bufio.NewScanner(httpResp.Body)}, nil
+}
+
+// StreamReader reads OpenAI-compatible server-sent event chunks.
+type StreamReader struct {
+	body       io.ReadCloser
+	scanner    *bufio.Scanner
+	closed     bool
+	hasContent bool
+}
+
+func (s *StreamReader) Recv() (*model.Response, error) {
+	for s.scanner.Scan() {
+		line := strings.TrimSpace(s.scanner.Text())
+		if line == "" || strings.HasPrefix(line, ":") {
+			continue
+		}
+		if !strings.HasPrefix(line, "data:") {
+			continue
+		}
+		data := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
+		if data == "[DONE]" {
+			return nil, io.EOF
+		}
+		var chunk struct {
+			Choices []struct {
+				FinishReason string `json:"finish_reason"`
+				Delta        struct {
+					Content string `json:"content"`
+				} `json:"delta"`
+			} `json:"choices"`
+			Usage *struct {
+				PromptTokens     int `json:"prompt_tokens"`
+				CompletionTokens int `json:"completion_tokens"`
+				TotalTokens      int `json:"total_tokens"`
+			} `json:"usage"`
+		}
+		if err := json.Unmarshal([]byte(data), &chunk); err != nil {
+			return nil, fmt.Errorf("failed to parse stream chunk: %w", err)
+		}
+		response := &model.Response{}
+		if len(chunk.Choices) > 0 {
+			choice := chunk.Choices[0]
+			if strings.TrimSpace(choice.Delta.Content) != "" {
+				s.hasContent = true
+			}
+			if choice.FinishReason == "length" && !s.hasContent {
+				return nil, model.ErrOutputLimit
+			}
+			response.Reply, response.StopReason = choice.Delta.Content, choice.FinishReason
+		}
+		if chunk.Usage != nil {
+			response.Usage = model.Usage{InputTokens: chunk.Usage.PromptTokens, OutputTokens: chunk.Usage.CompletionTokens, TotalTokens: chunk.Usage.TotalTokens}
+		}
+		if response.Reply != "" || response.StopReason != "" || chunk.Usage != nil {
+			return response, nil
+		}
+	}
+	if err := s.scanner.Err(); err != nil {
+		return nil, err
+	}
+	return nil, io.EOF
+}
+
+func (s *StreamReader) Close() error {
+	if s.closed {
+		return nil
+	}
+	s.closed = true
+	return s.body.Close()
+}

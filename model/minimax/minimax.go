@@ -1,0 +1,185 @@
+// Package minimax implements the MiniMax model provider.
+//
+// MiniMax offers MiniMax-M3.1-Flash and MiniMax-M3 via an OpenAI-compatible
+// chat completions endpoint.
+//
+// Usage:
+//
+//	import _ "go-micro.dev/v6/model/minimax"
+//
+//	m := model.New("minimax",
+//	    model.WithAPIKey("your-api-key"),
+//	)
+package minimax
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"fmt"
+	"io"
+	"net/http"
+	"strings"
+
+	"go-micro.dev/v6/model"
+	"go-micro.dev/v6/model/internal/openaiapi"
+)
+
+func init() {
+	model.Register("minimax", func(opts ...model.Option) model.Model {
+		return NewProvider(opts...)
+	})
+	model.RegisterStream("minimax")
+	model.RegisterToolStream("minimax")
+}
+
+type Provider struct {
+	opts model.Options
+}
+
+func NewProvider(opts ...model.Option) *Provider {
+	options := model.NewOptions(opts...)
+	if options.Model == "" {
+		options.Model = "MiniMax-M3.1-Flash"
+	}
+	if options.BaseURL == "" {
+		options.BaseURL = "https://api.minimax.io"
+	}
+	return &Provider{opts: options}
+}
+
+func (p *Provider) Init(opts ...model.Option) error {
+	for _, o := range opts {
+		o(&p.opts)
+	}
+	return nil
+}
+
+func (p *Provider) Options() model.Options { return p.opts }
+func (p *Provider) String() string         { return "minimax" }
+
+func (p *Provider) Generate(ctx context.Context, req *model.Request, opts ...model.GenerateOption) (*model.Response, error) {
+	if err := p.validateOptions(); err != nil {
+		return nil, err
+	}
+	return openaiapi.GenerateWithRequest(ctx, p.opts, req, p.callAPI, p.prepareRequest, opts...)
+}
+
+func (p *Provider) Stream(ctx context.Context, req *model.Request, opts ...model.GenerateOption) (model.Stream, error) {
+	if err := p.validateOptions(); err != nil {
+		return nil, err
+	}
+	return openaiapi.StreamWithRequest(ctx, p.opts, req, "/v1/chat/completions", p.prepareRequest)
+}
+
+func (p *Provider) validateOptions() error {
+	if p.opts.Model == "MiniMax-M3.1-Flash" {
+		if p.opts.Thinking != "" && p.opts.Thinking != model.ThinkingAdaptive {
+			return fmt.Errorf("MiniMax-M3.1-Flash supports only adaptive thinking")
+		}
+		switch p.opts.Effort {
+		case "", "low", "medium", "high", "xhigh", "max":
+		default:
+			return fmt.Errorf("unsupported MiniMax-M3.1-Flash reasoning effort: %q", p.opts.Effort)
+		}
+	}
+	return nil
+}
+
+func (p *Provider) prepareRequest(req map[string]any) {
+	switch p.opts.Model {
+	case "MiniMax-M3":
+		// M3 ignores reasoning effort; its default thinking mode is adaptive.
+		delete(req, "reasoning_effort")
+		if p.opts.Thinking != "" {
+			req["thinking"] = map[string]any{"type": p.opts.Thinking}
+		}
+	case "MiniMax-M3.1-Flash":
+		req["thinking"] = map[string]any{"type": "adaptive"}
+	}
+}
+
+func (p *Provider) callAPI(ctx context.Context, req map[string]any) (*model.Response, map[string]any, error) {
+	reqBody, err := json.Marshal(req)
+	if err != nil {
+		return nil, nil, fmt.Errorf("failed to marshal request: %w", err)
+	}
+
+	apiURL := strings.TrimRight(p.opts.BaseURL, "/") + "/v1/chat/completions"
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, apiURL, bytes.NewReader(reqBody))
+	if err != nil {
+		return nil, nil, fmt.Errorf("failed to create request: %w", err)
+	}
+
+	httpReq.Header.Set("Content-Type", "application/json")
+	httpReq.Header.Set("Authorization", "Bearer "+p.opts.APIKey)
+
+	httpResp, err := http.DefaultClient.Do(httpReq)
+	if err != nil {
+		return nil, nil, fmt.Errorf("API request failed: %w", err)
+	}
+	defer httpResp.Body.Close()
+
+	respBody, _ := io.ReadAll(httpResp.Body)
+	if httpResp.StatusCode != http.StatusOK {
+		return nil, nil, model.NewHTTPError(httpResp, respBody)
+	}
+
+	var chatResp struct {
+		Usage   openaiapi.ChatUsage `json:"usage"`
+		Choices []struct {
+			FinishReason string `json:"finish_reason"`
+			Message      struct {
+				ReasoningContent string `json:"reasoning_content"`
+				Content          string `json:"content"`
+				ToolCalls        []struct {
+					ID       string `json:"id"`
+					Type     string `json:"type"`
+					Function struct {
+						Name      string `json:"name"`
+						Arguments string `json:"arguments"`
+					} `json:"function"`
+				} `json:"tool_calls"`
+			} `json:"message"`
+		} `json:"choices"`
+	}
+
+	if err := json.Unmarshal(respBody, &chatResp); err != nil {
+		return nil, nil, fmt.Errorf("failed to parse response: %w", err)
+	}
+	if len(chatResp.Choices) == 0 {
+		return nil, nil, fmt.Errorf("no response from API")
+	}
+
+	choice := chatResp.Choices[0]
+	if err := openaiapi.CheckOutputLimit(choice.FinishReason, choice.Message.Content, len(choice.Message.ToolCalls)); err != nil {
+		return nil, nil, err
+	}
+	response := &model.Response{Reply: choice.Message.Content, StopReason: choice.FinishReason, Usage: chatResp.Usage.Usage()}
+
+	for _, tc := range choice.Message.ToolCalls {
+		args := strings.TrimSpace(tc.Function.Arguments)
+		var input map[string]any
+		if args == "" {
+			input = map[string]any{}
+		} else if err := json.Unmarshal([]byte(args), &input); err != nil {
+			return nil, nil, fmt.Errorf("tool %s arguments: %w", tc.Function.Name, err)
+		}
+		response.ToolCalls = append(response.ToolCalls, model.ToolCall{
+			ID:    tc.ID,
+			Name:  tc.Function.Name,
+			Input: input,
+		})
+	}
+
+	rawMessage := map[string]any{
+		"content":    choice.Message.Content,
+		"tool_calls": choice.Message.ToolCalls,
+	}
+
+	if choice.Message.ReasoningContent != "" {
+		rawMessage["reasoning_content"] = choice.Message.ReasoningContent
+	}
+
+	return response, rawMessage, nil
+}

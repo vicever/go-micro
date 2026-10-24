@@ -1,0 +1,338 @@
+// Package openai implements the OpenAI model provider
+package openai
+
+import (
+	"bufio"
+	"bytes"
+	"context"
+	"encoding/json"
+	"fmt"
+	"io"
+	"net/http"
+	"strings"
+
+	"go-micro.dev/v6/model"
+	"go-micro.dev/v6/model/internal/openaiapi"
+)
+
+func init() {
+	model.Register("openai", func(opts ...model.Option) model.Model {
+		return NewProvider(opts...)
+	})
+	model.RegisterImage("openai", func(opts ...model.Option) model.ImageModel {
+		return NewProvider(opts...)
+	})
+	model.RegisterStream("openai")
+	model.RegisterToolStream("openai")
+}
+
+// Provider implements the model.Model interface for OpenAI
+type Provider struct {
+	opts model.Options
+}
+
+// NewProvider creates a new OpenAI provider
+func NewProvider(opts ...model.Option) *Provider {
+	options := model.NewOptions(opts...)
+
+	// Set defaults if not provided
+	if options.Model == "" {
+		options.Model = "gpt-4o"
+	}
+	if options.BaseURL == "" {
+		options.BaseURL = "https://api.openai.com"
+	}
+
+	return &Provider{
+		opts: options,
+	}
+}
+
+// Init initializes the provider with options
+func (p *Provider) Init(opts ...model.Option) error {
+	for _, o := range opts {
+		o(&p.opts)
+	}
+	return nil
+}
+
+// Options returns the provider options
+func (p *Provider) Options() model.Options {
+	return p.opts
+}
+
+// String returns the provider name
+func (p *Provider) String() string {
+	return "openai"
+}
+
+// Generate generates a response from the model
+func (p *Provider) Generate(ctx context.Context, req *model.Request, opts ...model.GenerateOption) (*model.Response, error) {
+	return openaiapi.Generate(ctx, p.opts, req, p.callAPI, opts...)
+}
+
+// Stream generates a streaming response from the OpenAI chat completions API.
+func (p *Provider) Stream(ctx context.Context, req *model.Request, opts ...model.GenerateOption) (model.Stream, error) {
+	apiReq := openaiapi.Request(p.opts, openaiapi.Messages(req), nil)
+	apiReq["stream"] = true
+	apiReq["stream_options"] = map[string]any{"include_usage": true}
+	reqBody, err := json.Marshal(apiReq)
+	if err != nil {
+		return nil, fmt.Errorf("failed to marshal stream request: %w", err)
+	}
+	apiURL := strings.TrimRight(p.opts.BaseURL, "/") + "/v1/chat/completions"
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, apiURL, bytes.NewReader(reqBody))
+	if err != nil {
+		return nil, fmt.Errorf("failed to create stream request: %w", err)
+	}
+	httpReq.Header.Set("Content-Type", "application/json")
+	httpReq.Header.Set("Accept", "text/event-stream")
+	httpReq.Header.Set("Authorization", "Bearer "+p.opts.APIKey)
+
+	httpResp, err := http.DefaultClient.Do(httpReq)
+	if err != nil {
+		return nil, fmt.Errorf("stream API request failed: %w", err)
+	}
+	if httpResp.StatusCode != http.StatusOK {
+		defer httpResp.Body.Close()
+		respBody, _ := io.ReadAll(httpResp.Body)
+		return nil, fmt.Errorf("stream API error (%s): %s", httpResp.Status, string(respBody))
+	}
+	return &openAIStream{body: httpResp.Body, scanner: bufio.NewScanner(httpResp.Body)}, nil
+}
+
+type openAIStream struct {
+	body       io.ReadCloser
+	scanner    *bufio.Scanner
+	closed     bool
+	hasContent bool
+}
+
+func (s *openAIStream) Recv() (*model.Response, error) {
+	for s.scanner.Scan() {
+		line := strings.TrimSpace(s.scanner.Text())
+		if line == "" || strings.HasPrefix(line, ":") {
+			continue
+		}
+		if !strings.HasPrefix(line, "data:") {
+			continue
+		}
+		data := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
+		if data == "[DONE]" {
+			return nil, io.EOF
+		}
+		var chunk struct {
+			Choices []struct {
+				FinishReason string `json:"finish_reason"`
+				Delta        struct {
+					Content string `json:"content"`
+				} `json:"delta"`
+			} `json:"choices"`
+			Usage *struct {
+				PromptTokens     int `json:"prompt_tokens"`
+				CompletionTokens int `json:"completion_tokens"`
+				TotalTokens      int `json:"total_tokens"`
+			} `json:"usage"`
+		}
+		if err := json.Unmarshal([]byte(data), &chunk); err != nil {
+			return nil, fmt.Errorf("failed to parse stream chunk: %w", err)
+		}
+		response := &model.Response{}
+		if len(chunk.Choices) > 0 {
+			choice := chunk.Choices[0]
+			if strings.TrimSpace(choice.Delta.Content) != "" {
+				s.hasContent = true
+			}
+			if choice.FinishReason == "length" && !s.hasContent {
+				return nil, model.ErrOutputLimit
+			}
+			response.Reply, response.StopReason = choice.Delta.Content, choice.FinishReason
+		}
+		if chunk.Usage != nil {
+			response.Usage = model.Usage{InputTokens: chunk.Usage.PromptTokens, OutputTokens: chunk.Usage.CompletionTokens, TotalTokens: chunk.Usage.TotalTokens}
+		}
+		if response.Reply != "" || response.StopReason != "" || chunk.Usage != nil {
+			return response, nil
+		}
+	}
+	if err := s.scanner.Err(); err != nil {
+		return nil, err
+	}
+	return nil, io.EOF
+}
+
+func (s *openAIStream) Close() error {
+	if s.closed {
+		return nil
+	}
+	s.closed = true
+	return s.body.Close()
+}
+
+// callAPI makes an HTTP request to the OpenAI API
+func (p *Provider) callAPI(ctx context.Context, req map[string]any) (*model.Response, map[string]any, error) {
+	// Marshal request
+	reqBody, err := json.Marshal(req)
+	if err != nil {
+		return nil, nil, fmt.Errorf("failed to marshal request: %w", err)
+	}
+
+	// Build HTTP request
+	apiURL := strings.TrimRight(p.opts.BaseURL, "/") + "/v1/chat/completions"
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, apiURL, bytes.NewReader(reqBody))
+	if err != nil {
+		return nil, nil, fmt.Errorf("failed to create request: %w", err)
+	}
+
+	// Set headers
+	httpReq.Header.Set("Content-Type", "application/json")
+	httpReq.Header.Set("Authorization", "Bearer "+p.opts.APIKey)
+
+	// Make request
+	httpResp, err := http.DefaultClient.Do(httpReq)
+	if err != nil {
+		return nil, nil, fmt.Errorf("API request failed: %w", err)
+	}
+	defer httpResp.Body.Close()
+
+	// Read response
+	respBody, _ := io.ReadAll(httpResp.Body)
+	if httpResp.StatusCode != http.StatusOK {
+		return nil, nil, model.NewHTTPError(httpResp, respBody)
+	}
+
+	// Parse response
+	var chatResp struct {
+		Usage struct {
+			PromptTokens     int `json:"prompt_tokens"`
+			CompletionTokens int `json:"completion_tokens"`
+			TotalTokens      int `json:"total_tokens"`
+		} `json:"usage"`
+		Choices []struct {
+			FinishReason string `json:"finish_reason"`
+			Message      struct {
+				Content   string `json:"content"`
+				ToolCalls []struct {
+					ID       string `json:"id"`
+					Type     string `json:"type"`
+					Function struct {
+						Name      string `json:"name"`
+						Arguments string `json:"arguments"`
+					} `json:"function"`
+				} `json:"tool_calls"`
+			} `json:"message"`
+		} `json:"choices"`
+	}
+
+	if err := json.Unmarshal(respBody, &chatResp); err != nil {
+		return nil, nil, fmt.Errorf("failed to parse response: %w", err)
+	}
+
+	if len(chatResp.Choices) == 0 {
+		return nil, nil, fmt.Errorf("no response from API")
+	}
+
+	choice := chatResp.Choices[0]
+	if choice.FinishReason == "length" && strings.TrimSpace(choice.Message.Content) == "" && len(choice.Message.ToolCalls) == 0 {
+		return nil, nil, model.ErrOutputLimit
+	}
+	response := &model.Response{
+		Reply: choice.Message.Content,
+		Usage: model.Usage{InputTokens: chatResp.Usage.PromptTokens, OutputTokens: chatResp.Usage.CompletionTokens, TotalTokens: chatResp.Usage.TotalTokens},
+	}
+
+	response.StopReason = choice.FinishReason
+
+	// Extract tool calls
+	for _, tc := range choice.Message.ToolCalls {
+		args := strings.TrimSpace(tc.Function.Arguments)
+		var input map[string]any
+		if args == "" {
+			input = map[string]any{}
+		} else if err := json.Unmarshal([]byte(args), &input); err != nil {
+			return nil, nil, fmt.Errorf("tool %s arguments: %w", tc.Function.Name, err)
+		}
+		response.ToolCalls = append(response.ToolCalls, model.ToolCall{
+			ID:    tc.ID,
+			Name:  tc.Function.Name,
+			Input: input,
+		})
+	}
+
+	// Return raw message for potential follow-up
+	rawMessage := map[string]any{
+		"content":    choice.Message.Content,
+		"tool_calls": choice.Message.ToolCalls,
+	}
+
+	return response, rawMessage, nil
+}
+
+// gpt-image-1 is shut down on 2026-10-23 (https://developers.openai.com/api/docs/deprecations).
+const defaultImageModel = "gpt-image-2"
+
+func (p *Provider) GenerateImage(ctx context.Context, req *model.ImageRequest, opts ...model.GenerateOption) (*model.ImageResponse, error) {
+	modelName := req.Model
+	if modelName == "" {
+		modelName = defaultImageModel
+	}
+	n := req.N
+	if n <= 0 {
+		n = 1
+	}
+
+	apiReq := map[string]any{
+		"model":  modelName,
+		"prompt": req.Prompt,
+		"n":      n,
+	}
+	if req.Size != "" {
+		apiReq["size"] = req.Size
+	}
+
+	reqBody, err := json.Marshal(apiReq)
+	if err != nil {
+		return nil, fmt.Errorf("failed to marshal request: %w", err)
+	}
+
+	apiURL := strings.TrimRight(p.opts.BaseURL, "/") + "/v1/images/generations"
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, apiURL, bytes.NewReader(reqBody))
+	if err != nil {
+		return nil, fmt.Errorf("failed to create request: %w", err)
+	}
+
+	httpReq.Header.Set("Content-Type", "application/json")
+	httpReq.Header.Set("Authorization", "Bearer "+p.opts.APIKey)
+
+	httpResp, err := http.DefaultClient.Do(httpReq)
+	if err != nil {
+		return nil, fmt.Errorf("API request failed: %w", err)
+	}
+	defer httpResp.Body.Close()
+
+	respBody, _ := io.ReadAll(httpResp.Body)
+	if httpResp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("API error (%s): %s", httpResp.Status, string(respBody))
+	}
+
+	var imgResp struct {
+		Data []struct {
+			URL     string `json:"url"`
+			B64JSON string `json:"b64_json"`
+		} `json:"data"`
+	}
+
+	if err := json.Unmarshal(respBody, &imgResp); err != nil {
+		return nil, fmt.Errorf("failed to parse response: %w", err)
+	}
+
+	response := &model.ImageResponse{}
+	for _, d := range imgResp.Data {
+		response.Images = append(response.Images, model.Image{
+			URL:    d.URL,
+			Base64: d.B64JSON,
+		})
+	}
+
+	return response, nil
+}

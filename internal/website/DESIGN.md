@@ -1,0 +1,151 @@
+# DESIGN.md — Landing page style system
+
+Style contract for the Hugo/ Docsy landing pages (`content/en/_index.md`,
+`content/en/support.md`) and the shortcodes that build them
+(`layouts/_shortcodes/blocks/*`, `layouts/_shortcodes/elements/*`).
+
+## Homepage
+
+The homepage uses semantic sections in `content/en/_index.md` and styles scoped
+to `.micro-home` in `assets/scss/_landing.scss`. Keep the intro and install path
+visible together on desktop; stack them on mobile. Use white backgrounds, a pale
+teal setup panel, readable dark text, and the existing Go blue for links.
+
+Lead with the developer outcome and a complete journey. API option names belong
+in the guides. Show real commands and clearly identified example prompts, not
+invented terminal output or generated screenshots. Link all primary start actions
+to `/docs/quickstart.html`. Keep the service framework useful independently of AI.
+
+The shared block shortcodes below remain available to support and other pages.
+
+## Color tokens
+
+Defined in `assets/scss/_variables_project_after_bs.scss` and merged into
+Bootstrap's `$theme-colors`, so Docsy generates a `td-box--{color}` modifier
+for each:
+
+| token         | hex       | use                                  |
+|---------------|-----------|--------------------------------------|
+| `light`       | `#f8f9fa` | primary light section background     |
+| `deep-blue`   | `#03045e` |                                      |
+| `teal-blue`   | `#0077b6` |                                      |
+| `turquoise`   | `#00b4d8` | brand cyan                           |
+| `frosted-blue`| `#90e0ef` |                                      |
+| `light-cyan`  | `#caf0f8` |                                      |
+
+Plus Docsy built-ins: `primary`, `secondary`, `dark`, `light`, `white`, `gray`.
+
+A section background is set with `color="<token>"`, which renders
+`td-box--<token>`. `td-box--light` is used on the landing pages.
+
+## `bg-pattern`
+
+`assets/scss/_variables_project_after_bs.scss` → a radial dotted overlay
+(`rgba(0,173,216,0.15)` dots on a 20px grid). Applied as a modifier class on a
+section or hero. Toggle it with the shortcode `pattern` param (see below), not
+by hand.
+
+## Section rhythm
+
+The support page (`content/en/support.md`) uses
+`color="light" pattern=true padding="py-5"`. Cards use white or a pale cyan
+background with dark text and subtle borders. The navbar is white and the footer
+is light. Light mode is set for the whole site in `hugo.yaml` and the project
+SCSS, including browsers with a dark system preference.
+
+Use dark, readable syntax colors for inline HTML code samples. Links and button
+backgrounds use the darker Go blue (`#007d9c`) for contrast on light surfaces.
+
+## Shortcode contracts
+
+### `blocks/hero`
+
+```go-html-template
+{{% blocks/hero
+  height="max"          /* auto | min | med | max | full */
+  color="light"     /* td-box-- color token */
+  pattern=true          /* optional: add bg-pattern overlay */
+%}}
+...inner content...
+{{% /blocks/hero %}}
+```
+
+> Legacy: `td-below-navbar` is still appended to `height` as a navbar-offset
+> class (`height="max td-below-navbar"`). Move it to a dedicated param when one
+> is added — do not introduce new classes via `height`.
+
+### `blocks/section`
+
+```go-html-template
+{{% blocks/section
+  color="light"     /* td-box-- color token; defaults to auto-alternating by ordinal */
+  height="auto"         /* auto | min | med | max | full */
+  type="row"            /* container | row | text-center | ... Bootstrap utilities */
+  pattern=true          /* optional: add bg-pattern overlay */
+  padding="py-5"        /* optional: vertical padding utility; omit to use type/legacy */
+%}}
+...inner content...
+{{% /blocks/section %}}
+```
+
+### `blocks/link-down`
+
+```go-html-template
+{{% blocks/link-down color="info" %}}
+```
+
+### `elements/variant-card`
+
+```go-html-template
+{{% elements/variant-card
+  color="gradient"      /* dark | light | gradient */
+  title="Pluggable"
+  subtitle="Swap components without changing code"
+  content="top"         /* top | bottom: where .Inner (icon/preview) sits */
+%}}
+<div class="p-3 display-6">🔌</div>
+{{% /elements/variant-card %}}
+```
+
+## Anti-pattern (legacy — being retired)
+
+Do **not** pack extra classes into a single param:
+
+```go-html-template
+{{% blocks/section color="light bg-pattern py-5" type="row" %}}   <!-- WRONG -->
+{{% blocks/section color="light" pattern=true padding="py-5" type="row" %}}  <!-- RIGHT -->
+```
+
+`color`, `height`, and `type` are single-purpose. `pattern` and `padding` are
+first-class; alignment utilities (`text-center`) belong in `type`.
+
+`content/en/about/index.md` still uses the legacy `type="text-center h1 py-4"`
+(alignment + padding in `type`). Migrate it to `type="text-center"`
++ `padding="py-4"` when touched.
+
+## Sponsor logos
+
+In the `_index.md` Sponsors section, each logo is a local `<img>` rendered dark
+with a CSS filter on the light section background:
+
+```html
+<a href="/blog/2026/03/04/building-the-ai-native-future-of-go-micro-with-claude/"><img src="/images/sponsors/anthropic.svg" alt="Anthropic" class="sponsor-logo" /></a>
+```
+
+`.sponsor-logo` applies `filter: brightness(0)` — black
+regardless of the SVG's own fill. Using `<img>` (not a CSS mask) keeps the
+intrinsic size, so the logo can't collapse to zero width inside the `d-flex`
+row. Assets live in `static/images/sponsors/`. Swap a logo by replacing the
+file and the `src`; the filter handles the color.
+
+## Documentation
+
+Use the five links in `data/docs.yaml`: Getting started, Services, Agents,
+Workflows, Reference. The docs layout has one reading column, with the same
+links wrapping above it on mobile. Do not restore the generated section tree,
+right-hand contents panel, feedback form, or automatic child-page lists.
+
+The current guides have `params.docs_main: true`. Search indexes only those
+pages. Older URLs remain readable with a link to the current guides, but stay
+out of the main navigation and search. Keep detailed options in package and
+CLI references; the guides should teach one connected path.

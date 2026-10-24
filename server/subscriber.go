@@ -1,15 +1,10 @@
 package server
 
 import (
-	"bytes"
 	"fmt"
 	"reflect"
 
-	"github.com/micro/go-micro/broker"
-	"github.com/micro/go-micro/codec"
-	"github.com/micro/go-micro/metadata"
-	"github.com/micro/go-micro/registry"
-	"golang.org/x/net/context"
+	"go-micro.dev/v6/registry"
 )
 
 const (
@@ -17,23 +12,26 @@ const (
 )
 
 type handler struct {
-	method  reflect.Value
 	reqType reflect.Type
 	ctxType reflect.Type
+	method  reflect.Value
 }
 
 type subscriber struct {
-	topic      string
-	rcvr       reflect.Value
+	opts       SubscriberOptions
 	typ        reflect.Type
 	subscriber interface{}
+	rcvr       reflect.Value
+	topic      string
 	handlers   []*handler
 	endpoints  []*registry.Endpoint
-	opts       SubscriberOptions
 }
 
 func newSubscriber(topic string, sub interface{}, opts ...SubscriberOption) Subscriber {
-	var options SubscriberOptions
+	options := SubscriberOptions{
+		AutoAck: true,
+	}
+
 	for _, o := range opts {
 		o(&options)
 	}
@@ -158,82 +156,6 @@ func validateSubscriber(sub Subscriber) error {
 	}
 
 	return nil
-}
-
-func (s *rpcServer) createSubHandler(sb *subscriber, opts Options) broker.Handler {
-	return func(p broker.Publication) error {
-		msg := p.Message()
-		ct := msg.Header["Content-Type"]
-		cf, err := s.newCodec(ct)
-		if err != nil {
-			return err
-		}
-
-		hdr := make(map[string]string)
-		for k, v := range msg.Header {
-			hdr[k] = v
-		}
-		delete(hdr, "Content-Type")
-		ctx := metadata.NewContext(context.Background(), hdr)
-
-		for i := 0; i < len(sb.handlers); i++ {
-			handler := sb.handlers[i]
-
-			var isVal bool
-			var req reflect.Value
-
-			if handler.reqType.Kind() == reflect.Ptr {
-				req = reflect.New(handler.reqType.Elem())
-			} else {
-				req = reflect.New(handler.reqType)
-				isVal = true
-			}
-			if isVal {
-				req = req.Elem()
-			}
-
-			b := &buffer{bytes.NewBuffer(msg.Body)}
-			co := cf(b)
-			defer co.Close()
-
-			if err := co.ReadHeader(&codec.Message{}, codec.Publication); err != nil {
-				return err
-			}
-
-			if err := co.ReadBody(req.Interface()); err != nil {
-				return err
-			}
-
-			fn := func(ctx context.Context, msg Publication) error {
-				var vals []reflect.Value
-				if sb.typ.Kind() != reflect.Func {
-					vals = append(vals, sb.rcvr)
-				}
-				if handler.ctxType != nil {
-					vals = append(vals, reflect.ValueOf(ctx))
-				}
-
-				vals = append(vals, reflect.ValueOf(msg.Message()))
-
-				returnValues := handler.method.Call(vals)
-				if err := returnValues[0].Interface(); err != nil {
-					return err.(error)
-				}
-				return nil
-			}
-
-			for i := len(opts.SubWrappers); i > 0; i-- {
-				fn = opts.SubWrappers[i-1](fn)
-			}
-
-			go fn(ctx, &rpcPublication{
-				topic:       sb.topic,
-				contentType: ct,
-				message:     req.Interface(),
-			})
-		}
-		return nil
-	}
 }
 
 func (s *subscriber) Topic() string {

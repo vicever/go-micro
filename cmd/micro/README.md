@@ -1,0 +1,776 @@
+# Micro
+
+Go Micro Command Line
+
+`micro gateway` exposes services over HTTP and MCP. `micro server` is a deprecated alias.
+
+## Install the CLI
+
+The interactive chat features documented here are on `master`, not yet in the
+latest tagged release. Install Go 1.26 or newer, then install the development CLI:
+
+```
+go install go-micro.dev/v6/cmd/micro@master
+export PATH="$(go env GOPATH)/bin:$PATH"
+```
+
+
+## Develop through conversation
+
+```bash
+mkdir my-app && cd my-app
+micro chat
+```
+
+Choose a provider and enter a key when prompted. An existing provider environment
+key skips setup when it identifies one provider; `--provider NAME` selects explicitly.
+Use `/login` to replace a bad key. Keys entered here are saved for this project;
+environment variables and `--api_key` take precedence on restart.
+
+With no registered agents, the local agent works with project files, shell
+commands, skills, web pages, and registered service tools. It loads `AGENTS.md`
+and includes directory-specific instructions when reading files. Mutating tools
+and network requests use `/approve` or `/deny`; `--yes` allows unattended actions.
+Commands use host permissions unless `--sandbox IMAGE` selects Docker execution.
+
+Conversations and project settings persist across restarts. The terminal supports
+live text and command output, input editing, completion, and these controls:
+
+| Command | Behavior |
+|---|---|
+| `/model`, `/model ID`, `/models` | Select a model or list the provider catalog |
+| `/provider`, `/provider NAME [URL]` | Select a provider and optionally its endpoint |
+| `/login` | Replace the current provider API key without losing the conversation |
+| `/skills` | List project and personal skills |
+| `/paste`, then `/send` or `/cancel` | Compose or discard a multiline request |
+| `/queue` | Show follow-ups entered while the agent is busy |
+| `/steer MESSAGE` | Cancel current work and run the correction next |
+| `/stop`, Ctrl-C | Cancel current work and clear queued requests |
+| `/new`, `/sessions`, `/resume ID` | Create, list, or reopen conversations |
+| `/history`, `/search TEXT`, `/compact` | Inspect, search, or compact the conversation |
+| `/search --all TEXT` | Search recent conversations in the local project |
+| `/agents` | Show connected agents and their models |
+| `/approve`, `/deny` | Decide a pending local tool action |
+| `/exit` | Exit and stop foreground work |
+
+Use `--new` or `--session ID` from the shell. Model changes preserve the active
+conversation and apply to the next request. Catalogs use `model.ModelLister`;
+providers without a catalog accept explicit model IDs. Catalog membership does
+not guarantee chat/tool support or account access. Remote model settings belong
+to the host.
+
+Provider credentials entered at the masked prompt are saved per project and
+endpoint. Environment variables and flags override them without copying their
+values into settings. Local Ollama does not require a key.
+
+Project skills live in `.agents/skills/NAME/SKILL.md`; `~/.agents/skills` is a
+read-only personal library. Ask the agent to save a reusable procedure: the
+approved `workspace_save_skill` tool creates a project skill without overwriting
+an existing one. Skill scripts execute only through normal approved tools.
+
+To keep work running independently of chat, start a host in another terminal:
+
+```bash
+micro chat --host project
+# In another terminal, in the same project:
+micro chat project
+```
+
+Ask about earlier decisions normally: the local agent can search recent
+conversations in this project and return their source session IDs. Hosted agents
+control their own recall scope.
+
+Interactive replies render Markdown above the prompt and remain in scrollback.
+Command output stays plain text; piped output preserves Markdown source.
+
+`--host` binds to loopback. Connected chat shows tool activity and asks for
+approval using `/approve` or `/deny`. Disconnecting cancels pending approvals.
+Without host `--yes`, unattended mutating tools are refused.
+On the connected chat, `/background MESSAGE` submits work, `/tasks` lists it,
+`/task ID` inspects it, and `/cancel ID` cancels it. `/schedule 1h MESSAGE` saves a
+recurring request; `/schedules` lists definitions and `/unschedule ID` removes
+future dispatches. Results are saved in the selected conversation. The host must
+remain running; a stopped host does not replay unfinished tasks. One host owns
+scheduling for each agent/store namespace.
+
+Use `micro chat --sandbox IMAGE` to run commands in Docker with only the project
+mounted writable, networking disabled, and process/memory limits. The image must
+provide `sh`; Docker must be installed. This isolates command execution, not the
+agent's separately configured service or web tools.
+
+`web_fetch` reads HTTP(S) pages. Set `BRAVE_SEARCH_API_KEY` to enable `web_search`,
+or supply your own `agent/web.SearchFunc` in Go. These tools do not automate a
+JavaScript browser or access signed-in browser sessions.
+
+The development agent can still generate, compile, and start services. Those
+services and managed background commands belong to the local chat or host and
+stop when that process exits. Use `micro run` for hot reload.
+
+See [interactive agent development](../../internal/website/content/en/docs/interactive-agent.md)
+for framework APIs, streaming coverage, and lifecycle limits.
+
+To review a design before generating and running the project:
+
+```bash
+micro run --prompt "a notes service with saving, listing, and search" --provider openai
+```
+
+If agents are already registered, `micro chat` routes requests to them.
+`micro chat <name>` optionally selects a named agent. Create named
+agents with `micro.NewAgent` and assign service tools with `micro.AgentServices`;
+see the [Getting Started guide](../../internal/website/content/en/docs/getting-started/index.md).
+
+
+OpenAI is the default provider. For another provider, use
+`micro chat --provider anthropic` with its API key. When exactly one agent is
+registered, `micro chat` connects directly using that agent’s model and credentials.
+With multiple agents, the CLI needs a provider key to route requests;
+`micro chat <name>` connects directly to one without a local key. Put flags before
+the optional agent name.
+
+## Create a service
+
+Create your service (all setup is now automatic!):
+
+```
+micro new helloworld
+```
+
+Or use a template for common service patterns:
+
+```
+micro new contacts --template crud      # CRUD with Create/Read/Update/Delete/List
+micro new events --template pubsub      # Pub/sub with broker integration
+micro new gateway --template api        # API gateway with health check
+```
+
+This will:
+- Create a new service in the `helloworld` directory
+- Run `go mod tidy`; the default scaffold uses plain Go types
+- Show the updated project tree including generated files
+- Run `make proto` for `--proto` or protobuf templates, with install instructions if `protoc` is missing
+
+## Run the service
+
+Run your service:
+
+```
+micro run
+```
+
+This builds and runs the service, shows its logs, and rebuilds it when Go files
+change. Ctrl-C stops it. There is no chat console or gateway by default.
+
+In another terminal:
+
+```sh
+micro call helloworld Helloworld.Call '{"name":"World"}'
+micro chat
+```
+
+Use `micro gateway` separately for HTTP and MCP, or opt in with
+`micro run --gateway`.
+
+## Optional no-key examples
+
+To check the runtime without a provider key, ask the installed CLI for runnable
+examples and troubleshooting commands:
+
+```
+micro agent demo
+micro agent quickcheck
+micro examples
+micro zero-to-hero
+```
+
+`micro agent quickcheck` (alias: `micro agent debug`) prints the short recovery map when scaffold → run → chat → inspect stalls. Those commands point at the smallest mock-model first-agent example, the no-secret transcript, and the 0→hero support app before you add provider-backed chat.
+
+### Options
+
+```
+micro run                    # Services and hot reload
+micro run --gateway --address :3000 # Optional HTTP gateway
+micro run --no-watch         # Disable hot reload
+micro run --env production   # Use production environment
+micro run github.com/micro/blog  # Clone and run from GitHub
+```
+
+### Calling Services
+
+After starting `micro gateway`, call via curl:
+```bash
+curl -X POST http://localhost:8080/api/helloworld/Helloworld.Call -d '{"name": "World"}'
+```
+
+Or browse to http://localhost:8080 and use the web interface.
+
+List services:
+```
+micro services
+```
+
+## Configuration (micro.mu)
+
+For multi-service projects, create a `micro.mu` file to define services, dependencies, and environments:
+
+```
+service users
+    path ./users
+    port 8081
+
+service posts
+    path ./posts
+    port 8082
+    depends users
+
+service web
+    path ./web
+    port 8089
+    depends users posts
+
+env development
+    STORE_ADDRESS file://./data
+    DEBUG true
+
+env production
+    STORE_ADDRESS postgres://localhost/db
+```
+
+### Configuration Options
+
+| Property | Description |
+|----------|-------------|
+| `path` | Directory containing the service (with main.go) |
+| `port` | Port the service listens on (for health checks) |
+| `depends` | Services that must start first (space-separated) |
+
+### Environment Management
+
+Environment variables are injected based on the `--env` flag:
+
+```
+micro run                    # Uses 'development' env (default)
+micro run --env production   # Uses 'production' env
+MICRO_ENV=staging micro run  # Uses 'staging' env
+```
+
+### JSON Alternative
+
+You can also use `micro.json` if you prefer:
+
+```json
+{
+  "services": {
+    "users": { "path": "./users", "port": 8081 },
+    "posts": { "path": "./posts", "port": 8082, "depends": ["users"] }
+  },
+  "env": {
+    "development": { "STORE_ADDRESS": "file://./data" }
+  }
+}
+```
+
+### Without Configuration
+
+If no `micro.mu` or `micro.json` exists, `micro run` discovers all `main.go` files and runs them (original behavior).
+
+## Describe the service
+
+Describe the service to see available endpoints
+
+```
+micro describe helloworld
+```
+
+Output
+
+```
+{
+    "name": "helloworld",
+    "version": "latest",
+    "metadata": null,
+    "endpoints": [
+        {
+            "request": {
+                "name": "Request",
+                "type": "Request",
+                "values": [
+                    {
+                        "name": "name",
+                        "type": "string",
+                        "values": null
+                    }
+                ]
+            },
+            "response": {
+                "name": "Response",
+                "type": "Response",
+                "values": [
+                    {
+                        "name": "msg",
+                        "type": "string",
+                        "values": null
+                    }
+                ]
+            },
+            "metadata": {},
+            "name": "Helloworld.Call"
+        },
+        {
+            "request": {
+                "name": "Context",
+                "type": "Context",
+                "values": null
+            },
+            "response": {
+                "name": "Stream",
+                "type": "Stream",
+                "values": null
+            },
+            "metadata": {
+                "stream": "true"
+            },
+            "name": "Helloworld.Stream"
+        }
+    ],
+    "nodes": [
+        {
+            "metadata": {
+                "broker": "http",
+                "protocol": "mucp",
+                "registry": "mdns",
+                "server": "mucp",
+                "transport": "http"
+            },
+            "id": "helloworld-31e55be7-ac83-4810-89c8-a6192fb3ae83",
+            "address": "127.0.0.1:39963"
+        }
+    ]
+}
+```
+
+## Call the service
+
+Call via RPC endpoint
+
+```
+micro call helloworld Helloworld.Call '{"name": "Asim"}'
+```
+
+## Create a client
+
+Create a client to call the service
+
+```go
+package main
+
+import (
+        "context"
+        "fmt"
+
+        "go-micro.dev/v6"
+)
+
+type Request struct {
+        Name string
+}
+
+type Response struct {
+        Message string
+}
+
+func main() {
+        client := micro.NewService("helloworld").Client()
+
+        req := client.NewRequest("helloworld", "Helloworld.Call", &Request{Name: "John"})
+
+        var rsp Response
+
+        err := client.Call(context.TODO(), req, &rsp)
+        if err != nil {
+                fmt.Println(err)
+                return
+        }
+
+        fmt.Println(rsp.Message)
+}
+```
+
+## Building and Deployment
+
+### Build Binaries
+
+Build Go binaries for deployment:
+
+```bash
+micro build                     # Build for current OS
+micro build --os linux          # Cross-compile for Linux
+micro build --os linux --arch arm64  # For ARM64
+micro build --output ./dist     # Custom output directory
+```
+
+### Deploy to Server
+
+Deploy to any Linux server with systemd:
+
+```bash
+# First time: set up the server
+ssh user@server
+curl -fsSL https://go-micro.dev/install.sh | sh
+sudo micro init --server
+exit
+
+# Deploy from your laptop
+micro deploy user@server
+```
+
+The deploy command:
+1. Builds binaries for linux/amd64
+2. Copies via SSH to `/opt/micro/bin/`
+3. Sets up systemd services (`micro@<service>`)
+4. Restarts and verifies services are running
+
+### Named Deploy Targets
+
+Add deploy targets to `micro.mu`:
+
+```
+deploy prod
+    ssh deploy@prod.example.com
+
+deploy staging
+    ssh deploy@staging.example.com
+```
+
+Then:
+```bash
+micro deploy prod      # Deploy to production
+micro deploy staging   # Deploy to staging
+```
+
+### Managing Deployed Services
+
+```bash
+# Check status
+micro status --remote user@server
+
+# View logs
+micro logs --remote user@server
+micro logs myservice --remote user@server -f
+
+# Stop a service
+micro stop myservice --remote user@server
+```
+
+See [internal/website/docs/deployment.md](../../internal/website/docs/deployment.md) for the full deployment guide.
+
+## API Gateway
+
+Run a standalone HTTP-to-RPC gateway (no dashboard, no auth, no hot reload):
+
+```bash
+micro api                    # listen on :8080
+micro api --address :3000    # custom port
+```
+
+Routes:
+- `POST /{service}/{endpoint}` — proxies to an RPC call
+- `GET /` — lists all services and endpoints
+- `GET /{service}` — describes a service
+- `GET /health` — health check
+
+```bash
+curl -XPOST -d '{"name":"Alice"}' http://localhost:8080/greeter/Greeter.Hello
+```
+
+## Inspecting the Framework
+
+Every core interface has a matching CLI command:
+
+### Registry
+
+```bash
+micro registry list              # list all registered services (JSON)
+micro registry get <name>        # show nodes and endpoints for a service
+micro registry watch             # stream registration events
+```
+
+### Broker
+
+```bash
+micro broker publish <topic> <message>   # publish a message
+micro broker subscribe <topic>           # stream messages from a topic
+```
+
+### Store
+
+```bash
+micro store list [prefix]        # list keys (optionally by prefix)
+micro store read <key>           # read a record
+micro store write <key> <value>  # write a record
+micro store delete <key>         # delete a record
+```
+
+### Config
+
+```bash
+micro config get <key>           # read a config value (dot notation → env var)
+micro config dump                # print all configuration
+```
+
+Keys use dot notation: `database.host` reads from `DATABASE_HOST`.
+
+## AI & Agents
+
+### micro chat
+
+Interactive LLM agent that discovers services and orchestrates them through natural language:
+
+```bash
+ANTHROPIC_API_KEY=sk-ant-... micro chat --provider anthropic
+> list all users
+> send a welcome email to Alice
+```
+
+Supports: `--provider` (anthropic, openai, gemini, atlascloud, groq, mistral, openrouter, together), `--prompt` for single-shot mode, `--model` and `--base_url` for overrides.
+
+Environment variables: `MICRO_AI_PROVIDER`, `MICRO_AI_API_KEY`, or provider-specific keys like `ANTHROPIC_API_KEY`.
+
+### micro flow
+
+Event-driven LLM orchestration:
+
+```bash
+# Subscribe to events and react
+micro flow run --trigger events.user.created \
+  --prompt "New user: {{.Data}}. Send welcome email." \
+  --provider anthropic
+
+# One-shot execution
+micro flow exec --prompt "List all users" --provider anthropic
+```
+
+### micro mcp
+
+Expose services as MCP tools for AI agents:
+
+```bash
+micro mcp serve --tool notes.Notes.List  # local stdio MCP client
+micro mcp serve --address 127.0.0.1:3000  # Streamable HTTP at /mcp
+micro mcp list               # list available tools
+micro mcp test <tool>        # test a tool
+```
+
+## Protobuf 
+
+Use protobuf for code generation with [protoc-gen-micro](https://github.com/micro/go-micro/tree/master/cmd/protoc-gen-micro)
+
+## micro gateway
+
+Expose running services through HTTP and MCP:
+
+```sh
+micro gateway --address 127.0.0.1:8080 \
+  --mcp-address 127.0.0.1:3000 --mcp-tool notes.Notes.List
+```
+
+Connect a Streamable HTTP MCP client to `http://127.0.0.1:3000/mcp`.
+`/mcp/tools` on the dashboard is a JSON listing, not an MCP connection URL.
+Repeat `--mcp-tool` to select additional tools. This limits MCP only; the HTTP
+API still routes discovered services. Omitting the flag exposes the full MCP
+catalog, including framework tools.
+
+Each listener requires authentication by default when bound beyond loopback.
+Use `--auth` to require it locally, or `--no-auth` to explicitly disable it.
+`MICRO_AUTH_TOKEN` supplies a bearer token accepted by both listeners; otherwise
+one is generated and printed at startup. Stored gateway JWTs also work over MCP
+with their scopes and revocation checks. Use HTTPS for remote access.
+
+The gateway discovers running services; it does not build or start them.
+For the local development runner, use `micro run`.
+
+### API Endpoints 
+
+The API provides a fixed HTTP entrypoint for calling services
+
+```
+curl http://localhost:8080/api/helloworld/Helloworld/Call -d '{"name": "John"}'
+```
+See /api for more details and documentation for each service
+
+### Web Dashboard 
+
+The web dashboard provides a modern, secure UI for managing and exploring your Micro services. Major features include:
+
+- **Dynamic Service & Endpoint Forms**: Browse all registered services and endpoints. For each endpoint, a dynamic form is generated for easy testing and exploration.
+- **API Documentation**: The `/api` page lists all available services and endpoints, with request/response schemas and a sidebar for quick navigation. A documentation banner explains authentication requirements.
+- **JWT Authentication**: All login and token management uses a custom JWT utility. Passwords are securely stored with bcrypt. All `/api/x` endpoints and authenticated pages require an `Authorization: Bearer <token>` header (or `micro_token` cookie as fallback).
+- **Token Management**: The `/auth/tokens` page allows you to generate, view (obfuscated), and copy JWT tokens. Tokens are stored and can be revoked. When a user is deleted, all their tokens are revoked immediately.
+- **User Management**: The `/auth/users` page allows you to create, list, and delete users. Passwords are never shown or stored in plaintext.
+- **Token Revocation**: JWT tokens are stored and checked for revocation on every request. Revoked or deleted tokens are immediately invalidated.
+- **Security**: All protected endpoints use consistent authentication logic. Unauthorized or revoked tokens receive a 401 error. All sensitive actions require authentication.
+- **Logs & Status**: View service logs and status (PID, uptime, etc) directly from the dashboard.
+
+To get started, run:
+
+```
+micro gateway
+```
+
+Use the machine token printed at startup (or set `MICRO_AUTH_TOKEN`) to access the gateway. There is no default username/password. Loopback gateways do not require authentication unless explicitly enabled.
+
+> **Note:** See the `/api` page for details on API authentication and how to generate tokens for use with the HTTP API
+
+## Gateway Architecture
+
+`micro run --gateway` and `micro gateway` both use a unified gateway implementation (`cmd/micro/gateway/server.go`), providing consistent HTTP-to-RPC translation, service discovery, and web UI capabilities.
+
+### Key Differences
+
+| Feature | `micro run --gateway` | `micro gateway` |
+|---------|-------------|----------------|
+| **Purpose** | Development | Production |
+| **Authentication** | Depends on bind address | Depends on bind address |
+| **Process Management** | Yes (builds/runs services) | No (assumes services running) |
+| **Hot Reload** | Yes (watches files) | No |
+| **Scopes** | Available (`/auth/scopes`) | Available (`/auth/scopes`) |
+| **Use Case** | Local development | Deployed API gateway |
+
+### Why Unified?
+
+Previously, each command had its own gateway implementation, leading to code duplication. The unified gateway means:
+
+- New features (like MCP integration) benefit both commands
+- Consistent behavior between development and production
+- Single codebase to test and maintain
+- Same HTTP API, web UI, and service discovery logic
+
+### Gateway Features
+
+Both commands provide:
+
+- **HTTP API**: `POST /api/{service}/{endpoint}` with JSON request/response
+- **Service Discovery**: Automatic detection via registry (mdns/consul/etcd)
+- **Health Checks**: `/health`, `/health/live`, `/health/ready` endpoints
+- **Web Dashboard**: Browse services, test endpoints, view documentation
+- **Hot Service Updates**: Gateway automatically picks up new service registrations
+- **JWT Authentication**: Tokens, user management, login at `/auth/login`, `/auth/tokens`, `/auth/users`
+- **Endpoint Scopes**: Restrict which tokens can call which endpoints via `/auth/scopes`
+- **MCP Integration**: AI tools at `/mcp/tools`, agent playground at `/agent`
+
+### Authentication & Scopes
+
+Both `micro run` and `micro gateway` use the same `auth.Account` type from the go-micro framework. The gateway stores accounts under `auth/<id>` in the default store and uses JWT tokens with RS256 signing.
+
+**Scope enforcement** applies to all call paths:
+
+| Path | Description |
+|------|-------------|
+| `POST /api/{service}/{endpoint}` | HTTP API calls |
+| `POST /mcp/call` | MCP tool invocations |
+| Agent playground | Tool calls made by the AI agent |
+
+Scopes are configured via the web UI at `/auth/scopes`. Each endpoint can require one or more scopes. A token must carry at least one matching scope to call a protected endpoint. The `*` scope on a token bypasses all checks. Endpoints with no scopes set are open to any authenticated token.
+
+See the [Scopes](#scopes) section below for details.
+
+### Authentication defaults
+
+Authentication follows the bind address. `micro run` binds to `127.0.0.1:8080`
+by default, so ordinary local calls do not require a login. Exposed addresses
+(such as `:8080` or `0.0.0.0:8080`) enable authentication automatically.
+
+There is no default username/password. Use the machine token printed at startup,
+or supply one with `--auth-token` / `MICRO_AUTH_TOKEN`. Send it as a Bearer token;
+for browser access, use `?token=<token>`. You can explicitly select `--auth` or
+`--no-auth` (`MICRO_AUTH=on|off`). Endpoint scopes remain enforced even when
+ordinary loopback calls are open.
+
+See [micro run](../../internal/website/content/en/docs/guides/micro-run.md)
+for the local workflow and [gateway implementation](gateway/server.go) for
+embedding details.
+
+### Scopes
+
+Scopes provide fine-grained access control over which tokens can call which service endpoints. They are managed through the web UI at `/auth/scopes` and enforced on every call through the gateway.
+
+#### How It Works
+
+1. **Define scopes on endpoints** — Visit `/auth/scopes` and set required scopes for each service endpoint (e.g., set `billing` on `payments.Payments.Charge`)
+2. **Create tokens with scopes** — Visit `/auth/tokens` and create tokens with matching scopes (e.g., a token with `billing` scope)
+3. **Scopes are enforced** — When a token calls an endpoint, the gateway checks that the token has at least one scope matching the endpoint's required scopes
+
+#### Scope Matching Rules
+
+- Scopes are **exact string matches** — `billing` on a token matches `billing` on an endpoint
+- A token with `*` scope bypasses all scope checks (admin wildcard)
+- Endpoints with **no scopes set** are open to any valid token
+- An endpoint can require **multiple scopes** — the token needs to match just one
+- Scope names are free-form strings — use whatever convention fits your project
+
+#### Common Patterns
+
+| Pattern | Endpoint Scopes | Token Scopes | Result |
+|---------|----------------|--------------|--------|
+| Protect a service | Set `greeter` on all greeter endpoints (use Bulk Set with `greeter.*`) | Token with `greeter` | Token can call any greeter endpoint |
+| Restrict an endpoint | Set `billing` on `payments.Payments.Charge` | Token with `billing` | Only that endpoint is restricted |
+| Role-based | Set `admin` on sensitive endpoints | Admin token with `admin`, user token with `user` | Only admin tokens can call sensitive endpoints |
+| Full access | Any | Token with `*` | Bypasses all scope checks |
+
+#### Relationship to Framework Auth
+
+The gateway's scope system uses `auth.Account` from the go-micro framework. Scopes on accounts are the same `[]string` field used by the framework's `auth.Rules` and `wrapper/auth` package. The gateway stores scope requirements in the default store under `endpoint-scopes/<service>.<endpoint>` keys and checks them on every HTTP request.
+
+For service-level (RPC) auth within the go-micro mesh, use the `wrapper/auth` package which provides `auth.Rules` with priority-based access control. See the [auth wrapper documentation](../../wrapper/auth/README.md) for details.
+
+## Self-improving loop (`micro loop`)
+
+Turn a repository into a self-improving one: GitHub Actions workflows that
+dispatch a coding agent to plan, build, and triage — gated by CI. This is the
+same loop that maintains go-micro itself, generalized so any repo (and any
+@mention-driven agent) can use it.
+
+```bash
+micro loop init      # scaffold the loop into the current repo
+micro loop verify    # check a repo is wired correctly
+```
+
+`micro loop init` writes the selected roles' workflows, their prompts, and a queue. Choose roles with `--roles` (default `planner,builder,triage`; `--roles all` for everything):
+
+| Role | Workflow | What it does |
+|------|----------|--------------|
+| Planner | `loop-planner.yml` | Keeps a ranked queue in `.github/loop/PRIORITIES.md` |
+| Builder | `loop-builder.yml` | Builds the top open item as a single-concern PR, auto-merged on green CI |
+| Triage | `loop-triage.yml` | Turns CI failures into scoped fix issues, back into the queue |
+| Coherence | `loop-coherence.yml` | Keeps README/docs/CHANGELOG aligned with the North Star *(opt-in)* |
+| Security | `loop-security.yml` | Audits for vulnerabilities and files them; never auto-merges fixes, never publishes exploit detail *(opt-in)* |
+| Release | `loop-release.yml` | Cuts the next patch tag when the branch has new commits *(opt-in)* |
+
+The workflows are the **mechanism**; each dispatch role's instruction is an editable file in `.github/loop/prompts/` — the **policy**. Edit those prompts (and `.github/loop/NORTH_STAR.md`) to steer the loop without touching the CLI. That split is what lets go-micro itself use `micro loop` while keeping its own richer prompts.
+
+Common flags:
+
+```bash
+micro loop init \
+  --roles all \
+  --agent @codex \
+  --token-secret LOOP_TOKEN \
+  --branch main \
+  --ci-workflow CI
+```
+
+- `--roles`: which roles to scaffold (`planner,builder,triage`, or `all`)
+- `--agent`: how the workflows summon the agent — any `@mention`-driven coding agent (e.g. `@codex`, `@claude`)
+- `--token-secret`: repo secret holding the driving user PAT
+- `--branch`: base branch for the loop's PRs
+- `--ci-workflow`: `name:` of the CI workflow triage watches
+- `--tag-prefix`: tag prefix the release role matches and bumps (default `v`)
+
+Two things the CLI can't do for you (and `micro loop verify` reminds you of):
+
+1. **Add the token secret.** The agent ignores `@mentions` from the
+   `github-actions` bot, so dispatch posts as a real user via a PAT stored in
+   the `--token-secret` repo secret. The workflows no-op until it's set.
+2. **Set branch protection.** Require the CI checks with **0 approving reviews**
+   so the builder's native auto-merge lands PRs the moment CI is green — that
+   green-CI gate is the loop's only safety mechanism, so keep the suite strong.

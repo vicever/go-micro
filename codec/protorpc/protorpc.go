@@ -1,13 +1,15 @@
+// Protorpc provides a net/rpc proto-rpc codec. See envelope.proto for the format.
 package protorpc
 
 import (
 	"bytes"
 	"fmt"
 	"io"
+	"strconv"
 	"sync"
 
 	"github.com/golang/protobuf/proto"
-	"github.com/micro/go-micro/codec"
+	"go-micro.dev/v6/codec"
 )
 
 type flusher interface {
@@ -15,10 +17,10 @@ type flusher interface {
 }
 
 type protoCodec struct {
-	sync.Mutex
 	rwc io.ReadWriteCloser
-	mt  codec.MessageType
 	buf *bytes.Buffer
+	mt  codec.MessageType
+	sync.Mutex
 }
 
 func (c *protoCodec) Close() error {
@@ -30,13 +32,22 @@ func (c *protoCodec) String() string {
 	return "proto-rpc"
 }
 
+func id(id string) uint64 {
+	p, err := strconv.ParseInt(id, 10, 64)
+	if err != nil {
+		p = 0
+	}
+	i := uint64(p)
+	return i
+}
+
 func (c *protoCodec) Write(m *codec.Message, b interface{}) error {
 	switch m.Type {
 	case codec.Request:
 		c.Lock()
 		defer c.Unlock()
 		// This is protobuf, of course we copy it.
-		pbr := &Request{ServiceMethod: &m.Method, Seq: &m.Id}
+		pbr := &Request{ServiceMethod: m.Method, Seq: id(m.Id)}
 		data, err := proto.Marshal(pbr)
 		if err != nil {
 			return err
@@ -45,8 +56,12 @@ func (c *protoCodec) Write(m *codec.Message, b interface{}) error {
 		if err != nil {
 			return err
 		}
-		// Of course this is a protobuf! Trust me or detonate the program.
-		data, err = proto.Marshal(b.(proto.Message))
+		// dont trust or incoming message
+		m, ok := b.(proto.Message)
+		if !ok {
+			return codec.ErrInvalidMessage
+		}
+		data, err = proto.Marshal(m)
 		if err != nil {
 			return err
 		}
@@ -55,12 +70,14 @@ func (c *protoCodec) Write(m *codec.Message, b interface{}) error {
 			return err
 		}
 		if flusher, ok := c.rwc.(flusher); ok {
-			err = flusher.Flush()
+			if err = flusher.Flush(); err != nil {
+				return err
+			}
 		}
-	case codec.Response:
+	case codec.Response, codec.Error:
 		c.Lock()
 		defer c.Unlock()
-		rtmp := &Response{ServiceMethod: &m.Method, Seq: &m.Id, Error: &m.Error}
+		rtmp := &Response{ServiceMethod: m.Method, Seq: id(m.Id), Error: m.Error}
 		data, err := proto.Marshal(rtmp)
 		if err != nil {
 			return err
@@ -82,16 +99,22 @@ func (c *protoCodec) Write(m *codec.Message, b interface{}) error {
 			return err
 		}
 		if flusher, ok := c.rwc.(flusher); ok {
-			err = flusher.Flush()
+			if err = flusher.Flush(); err != nil {
+				return err
+			}
 		}
-	case codec.Publication:
-		data, err := proto.Marshal(b.(proto.Message))
+	case codec.Event:
+		m, ok := b.(proto.Message)
+		if !ok {
+			return codec.ErrInvalidMessage
+		}
+		data, err := proto.Marshal(m)
 		if err != nil {
 			return err
 		}
-		c.rwc.Write(data)
+		_, _ = c.rwc.Write(data)
 	default:
-		return fmt.Errorf("Unrecognised message type: %v", m.Type)
+		return fmt.Errorf("unrecognized message type: %v", m.Type)
 	}
 	return nil
 }
@@ -112,7 +135,7 @@ func (c *protoCodec) ReadHeader(m *codec.Message, mt codec.MessageType) error {
 			return err
 		}
 		m.Method = rtmp.GetServiceMethod()
-		m.Id = rtmp.GetSeq()
+		m.Id = fmt.Sprintf("%d", rtmp.GetSeq())
 	case codec.Response:
 		data, err := ReadNetString(c.rwc)
 		if err != nil {
@@ -124,12 +147,13 @@ func (c *protoCodec) ReadHeader(m *codec.Message, mt codec.MessageType) error {
 			return err
 		}
 		m.Method = rtmp.GetServiceMethod()
-		m.Id = rtmp.GetSeq()
+		m.Id = fmt.Sprintf("%d", rtmp.GetSeq())
 		m.Error = rtmp.GetError()
-	case codec.Publication:
-		io.Copy(c.buf, c.rwc)
+	case codec.Event:
+		_, err := io.Copy(c.buf, c.rwc)
+		return err
 	default:
-		return fmt.Errorf("Unrecognised message type: %v", mt)
+		return fmt.Errorf("unrecognized message type: %v", mt)
 	}
 	return nil
 }
@@ -143,10 +167,10 @@ func (c *protoCodec) ReadBody(b interface{}) error {
 		if err != nil {
 			return err
 		}
-	case codec.Publication:
+	case codec.Event:
 		data = c.buf.Bytes()
 	default:
-		return fmt.Errorf("Unrecognised message type: %v", c.mt)
+		return fmt.Errorf("unrecognized message type: %v", c.mt)
 	}
 	if b != nil {
 		return proto.Unmarshal(data, b.(proto.Message))

@@ -1,42 +1,39 @@
 package selector
 
 import (
+	"os"
 	"testing"
 
-	"github.com/micro/go-micro/registry"
+	"go-micro.dev/v6/registry"
 )
 
 func TestStrategies(t *testing.T) {
 	testData := []*registry.Service{
-		&registry.Service{
+		{
 			Name:    "test1",
 			Version: "latest",
 			Nodes: []*registry.Node{
-				&registry.Node{
+				{
 					Id:      "test1-1",
-					Address: "10.0.0.1",
-					Port:    1001,
+					Address: "10.0.0.1:1001",
 				},
-				&registry.Node{
+				{
 					Id:      "test1-2",
-					Address: "10.0.0.2",
-					Port:    1002,
+					Address: "10.0.0.2:1002",
 				},
 			},
 		},
-		&registry.Service{
+		{
 			Name:    "test1",
 			Version: "default",
 			Nodes: []*registry.Node{
-				&registry.Node{
+				{
 					Id:      "test1-3",
-					Address: "10.0.0.3",
-					Port:    1003,
+					Address: "10.0.0.3:1003",
 				},
-				&registry.Node{
+				{
 					Id:      "test1-4",
-					Address: "10.0.0.4",
-					Port:    1004,
+					Address: "10.0.0.4:1004",
 				},
 			},
 		},
@@ -54,6 +51,8 @@ func TestStrategies(t *testing.T) {
 			counts[node.Id]++
 		}
 
-		t.Logf("%s: %+v\n", name, counts)
+		if len(os.Getenv("IN_TRAVIS_CI")) == 0 {
+			t.Logf("%s: %+v\n", name, counts)
+		}
 	}
 }

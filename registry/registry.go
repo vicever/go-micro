@@ -5,38 +5,74 @@ import (
 	"errors"
 )
 
+var (
+	// ErrUnavailable means the discovery backend could not be reached.
+	ErrUnavailable = errors.New("registry unavailable")
+	// Not found error when GetService is called.
+	ErrNotFound = errors.New("service not found")
+	// Watcher stopped error when watcher is stopped.
+	ErrWatcherStopped = errors.New("watcher stopped")
+)
+
 // The registry provides an interface for service discovery
 // and an abstraction over varying implementations
-// {consul, etcd, zookeeper, ...}
+// {consul, etcd, zookeeper, ...}.
 type Registry interface {
+	Init(...Option) error
+	Options() Options
 	Register(*Service, ...RegisterOption) error
-	Deregister(*Service) error
-	GetService(string) ([]*Service, error)
-	ListServices() ([]*Service, error)
-	Watch() (Watcher, error)
+	Deregister(*Service, ...DeregisterOption) error
+	GetService(string, ...GetOption) ([]*Service, error)
+	ListServices(...ListOption) ([]*Service, error)
+	Watch(...WatchOption) (Watcher, error)
 	String() string
+}
+
+type Service struct {
+	Name      string            `json:"name"`
+	Version   string            `json:"version"`
+	Metadata  map[string]string `json:"metadata"`
+	Endpoints []*Endpoint       `json:"endpoints"`
+	Nodes     []*Node           `json:"nodes"`
+}
+
+type Node struct {
+	Metadata map[string]string `json:"metadata"`
+	Id       string            `json:"id"`
+	Address  string            `json:"address"`
+}
+
+type Endpoint struct {
+	Request  *Value            `json:"request"`
+	Response *Value            `json:"response"`
+	Metadata map[string]string `json:"metadata"`
+	Name     string            `json:"name"`
+}
+
+type Value struct {
+	Name   string   `json:"name"`
+	Type   string   `json:"type"`
+	Values []*Value `json:"values"`
 }
 
 type Option func(*Options)
 
 type RegisterOption func(*RegisterOptions)
 
-var (
-	DefaultRegistry = newConsulRegistry()
+type WatchOption func(*WatchOptions)
 
-	ErrNotFound = errors.New("not found")
-)
+type DeregisterOption func(*DeregisterOptions)
 
-func NewRegistry(opts ...Option) Registry {
-	return newConsulRegistry(opts...)
-}
+type GetOption func(*GetOptions)
+
+type ListOption func(*ListOptions)
 
 // Register a service node. Additionally supply options such as TTL.
 func Register(s *Service, opts ...RegisterOption) error {
 	return DefaultRegistry.Register(s, opts...)
 }
 
-// Deregister a service node
+// Deregister a service node.
 func Deregister(s *Service) error {
 	return DefaultRegistry.Deregister(s)
 }
@@ -46,16 +82,20 @@ func GetService(name string) ([]*Service, error) {
 	return DefaultRegistry.GetService(name)
 }
 
-// List the services. Only returns service names
+// List the services. Only returns service names.
 func ListServices() ([]*Service, error) {
 	return DefaultRegistry.ListServices()
 }
 
 // Watch returns a watcher which allows you to track updates to the registry.
-func Watch() (Watcher, error) {
-	return DefaultRegistry.Watch()
+func Watch(opts ...WatchOption) (Watcher, error) {
+	return DefaultRegistry.Watch(opts...)
 }
 
 func String() string {
 	return DefaultRegistry.String()
 }
+
+var (
+	DefaultRegistry = NewMDNSRegistry()
+)

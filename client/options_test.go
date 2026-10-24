@@ -4,7 +4,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/micro/go-micro/transport"
+	"go-micro.dev/v6/transport"
 )
 
 func TestCallOptions(t *testing.T) {
@@ -23,7 +23,7 @@ func TestCallOptions(t *testing.T) {
 		var cl Client
 
 		if d.set {
-			opts = newOptions(
+			opts = NewOptions(
 				Retries(d.retries),
 				RequestTimeout(d.rtimeout),
 				DialTimeout(d.dtimeout),
@@ -35,7 +35,7 @@ func TestCallOptions(t *testing.T) {
 				DialTimeout(d.dtimeout),
 			)
 		} else {
-			opts = newOptions()
+			opts = NewOptions()
 			cl = NewClient()
 		}
 
@@ -78,8 +78,6 @@ func TestCallOptions(t *testing.T) {
 			if e := o.CallOptions.DialTimeout * (time.Second * 10); callOpts.DialTimeout != e {
 				t.Fatalf("Expected %v got %v", e, callOpts.DialTimeout)
 			}
-
 		}
-
 	}
 }

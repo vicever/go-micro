@@ -1,0 +1,80 @@
+package openaiapi
+
+import (
+	"context"
+	"fmt"
+
+	"go-micro.dev/v6/model"
+)
+
+// MaxToolRounds bounds the legacy v6 tool loop shared by compatible providers.
+// Agent guardrails can impose additional limits on individual tool executions.
+const MaxToolRounds = 12
+
+// Generate preserves history, options, and tool definitions across model turns.
+// call performs one provider request; automatic tool execution remains supported
+// here for callers of the v6 model API that supply a ToolHandler.
+func Generate(ctx context.Context, opts model.Options, req *model.Request, call func(context.Context, map[string]any) (*model.Response, map[string]any, error), options ...model.GenerateOption) (*model.Response, error) {
+	return GenerateWithRequest(ctx, opts, req, call, nil, options...)
+}
+
+// GenerateWithRequest applies provider-specific parameters to every request,
+// including streaming generation and tool follow-ups.
+func GenerateWithRequest(ctx context.Context, opts model.Options, req *model.Request, call func(context.Context, map[string]any) (*model.Response, map[string]any, error), prepare func(map[string]any), options ...model.GenerateOption) (*model.Response, error) {
+	if onToken := model.NewGenerateOptions(options...).OnToken; onToken != nil {
+		call = func(ctx context.Context, req map[string]any) (*model.Response, map[string]any, error) {
+			return streamCall(ctx, opts, req, onToken)
+		}
+	}
+	if prepare != nil {
+		send := call
+		call = func(ctx context.Context, request map[string]any) (*model.Response, map[string]any, error) {
+			prepare(request)
+			return send(ctx, request)
+		}
+	}
+	messages := Messages(req)
+	resp, raw, err := call(ctx, Request(opts, messages, req.Tools))
+	if err != nil {
+		return nil, err
+	}
+	if opts.ToolHandler == nil {
+		return resp, nil
+	}
+
+	pending := resp.ToolCalls
+	for round := 0; len(pending) > 0 && round < MaxToolRounds; round++ {
+		message := make(map[string]any, len(raw)+1)
+		for key, value := range raw {
+			message[key] = value
+		}
+		message["role"] = "assistant"
+		messages = append(messages, message)
+		for _, tc := range pending {
+			content := opts.ToolHandler(ctx, tc).Content
+			messages = append(messages, map[string]any{
+				"role":         "tool",
+				"tool_call_id": tc.ID,
+				"content":      content,
+			})
+		}
+
+		next, nextRaw, err := call(ctx, Request(opts, messages, req.Tools))
+		if err != nil {
+			return nil, fmt.Errorf("tool follow-up: %w", err)
+		}
+		if next.Reply != "" {
+			resp.Answer = next.Reply
+		}
+		resp.StopReason = next.StopReason
+		// Every request of the tool round is billed, not only the first one.
+		resp.Usage = model.Usage{
+			InputTokens:  resp.Usage.InputTokens + next.Usage.InputTokens,
+			OutputTokens: resp.Usage.OutputTokens + next.Usage.OutputTokens,
+			TotalTokens:  resp.Usage.TotalTokens + next.Usage.TotalTokens,
+		}
+		pending, raw = next.ToolCalls, nextRaw
+		resp.ToolCalls = append(resp.ToolCalls, next.ToolCalls...)
+	}
+	return resp, nil
+}

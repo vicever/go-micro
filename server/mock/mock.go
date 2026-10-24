@@ -4,16 +4,16 @@ import (
 	"errors"
 	"sync"
 
-	"github.com/micro/go-micro/server"
-	"github.com/pborman/uuid"
+	"github.com/google/uuid"
+	"go-micro.dev/v6/server"
 )
 
 type MockServer struct {
-	sync.Mutex
-	Running     bool
 	Opts        server.Options
 	Handlers    map[string]server.Handler
 	Subscribers map[string][]server.Subscriber
+	sync.Mutex
+	Running bool
 }
 
 var (
@@ -69,7 +69,7 @@ func (m *MockServer) NewHandler(h interface{}, opts ...server.HandlerOption) ser
 	}
 
 	return &MockHandler{
-		Id:   uuid.NewUUID().String(),
+		Id:   uuid.New().String(),
 		Hdlr: h,
 		Opts: options,
 	}

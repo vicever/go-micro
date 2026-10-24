@@ -1,26 +1,31 @@
 package client
 
 import (
-	"math"
+	"context"
 	"testing"
 	"time"
-
-	"golang.org/x/net/context"
 )
 
 func TestBackoff(t *testing.T) {
-	delta := time.Duration(0)
+	results := []time.Duration{
+		0 * time.Second,
+		100 * time.Millisecond,
+		600 * time.Millisecond,
+		1900 * time.Millisecond,
+		4300 * time.Millisecond,
+		7900 * time.Millisecond,
+	}
+
+	c := NewClient()
 
 	for i := 0; i < 5; i++ {
-		d, err := exponentialBackoff(context.TODO(), NewJsonRequest("test", "test", nil), i)
+		d, err := exponentialBackoff(context.TODO(), c.NewRequest("test", "test", nil), i)
 		if err != nil {
 			t.Fatal(err)
 		}
 
-		if d < delta {
-			t.Fatalf("Expected greater than %v, got %v", delta, d)
+		if d != results[i] {
+			t.Fatalf("Expected equal than %v, got %v", results[i], d)
 		}
-
-		delta = time.Millisecond * time.Duration(math.Pow(10, float64(i+1)))
 	}
 }

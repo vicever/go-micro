@@ -1,0 +1,147 @@
+// Package mistral implements the Mistral AI model provider.
+//
+// Mistral AI is a European AI company offering high-performance models
+// via an OpenAI-compatible chat completions endpoint.
+//
+// Usage:
+//
+//	import _ "go-micro.dev/v6/model/mistral"
+//
+//	m := model.New("mistral",
+//	    model.WithAPIKey("your-api-key"),
+//	)
+package mistral
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"fmt"
+	"io"
+	"net/http"
+	"strings"
+
+	"go-micro.dev/v6/model"
+	"go-micro.dev/v6/model/internal/openaiapi"
+)
+
+func init() {
+	model.Register("mistral", func(opts ...model.Option) model.Model {
+		return NewProvider(opts...)
+	})
+	model.RegisterStream("mistral")
+	model.RegisterToolStream("mistral")
+}
+
+type Provider struct {
+	opts model.Options
+}
+
+func NewProvider(opts ...model.Option) *Provider {
+	options := model.NewOptions(opts...)
+	if options.Model == "" {
+		options.Model = "mistral-large-latest"
+	}
+	if options.BaseURL == "" {
+		options.BaseURL = "https://api.mistral.ai"
+	}
+	return &Provider{opts: options}
+}
+
+func (p *Provider) Init(opts ...model.Option) error {
+	for _, o := range opts {
+		o(&p.opts)
+	}
+	return nil
+}
+
+func (p *Provider) Options() model.Options { return p.opts }
+func (p *Provider) String() string         { return "mistral" }
+
+func (p *Provider) Generate(ctx context.Context, req *model.Request, opts ...model.GenerateOption) (*model.Response, error) {
+	return openaiapi.Generate(ctx, p.opts, req, p.callAPI, opts...)
+}
+
+func (p *Provider) Stream(ctx context.Context, req *model.Request, opts ...model.GenerateOption) (model.Stream, error) {
+	return openaiapi.Stream(ctx, p.opts, req, "/v1/chat/completions")
+}
+
+func (p *Provider) callAPI(ctx context.Context, req map[string]any) (*model.Response, map[string]any, error) {
+	reqBody, err := json.Marshal(req)
+	if err != nil {
+		return nil, nil, fmt.Errorf("failed to marshal request: %w", err)
+	}
+
+	apiURL := strings.TrimRight(p.opts.BaseURL, "/") + "/v1/chat/completions"
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, apiURL, bytes.NewReader(reqBody))
+	if err != nil {
+		return nil, nil, fmt.Errorf("failed to create request: %w", err)
+	}
+
+	httpReq.Header.Set("Content-Type", "application/json")
+	httpReq.Header.Set("Authorization", "Bearer "+p.opts.APIKey)
+
+	httpResp, err := http.DefaultClient.Do(httpReq)
+	if err != nil {
+		return nil, nil, fmt.Errorf("API request failed: %w", err)
+	}
+	defer httpResp.Body.Close()
+
+	respBody, _ := io.ReadAll(httpResp.Body)
+	if httpResp.StatusCode != http.StatusOK {
+		return nil, nil, model.NewHTTPError(httpResp, respBody)
+	}
+
+	var chatResp struct {
+		Usage   openaiapi.ChatUsage `json:"usage"`
+		Choices []struct {
+			FinishReason string `json:"finish_reason"`
+			Message      struct {
+				Content   string `json:"content"`
+				ToolCalls []struct {
+					ID       string `json:"id"`
+					Type     string `json:"type"`
+					Function struct {
+						Name      string `json:"name"`
+						Arguments string `json:"arguments"`
+					} `json:"function"`
+				} `json:"tool_calls"`
+			} `json:"message"`
+		} `json:"choices"`
+	}
+
+	if err := json.Unmarshal(respBody, &chatResp); err != nil {
+		return nil, nil, fmt.Errorf("failed to parse response: %w", err)
+	}
+	if len(chatResp.Choices) == 0 {
+		return nil, nil, fmt.Errorf("no response from API")
+	}
+
+	choice := chatResp.Choices[0]
+	if err := openaiapi.CheckOutputLimit(choice.FinishReason, choice.Message.Content, len(choice.Message.ToolCalls)); err != nil {
+		return nil, nil, err
+	}
+	response := &model.Response{Reply: choice.Message.Content, StopReason: choice.FinishReason, Usage: chatResp.Usage.Usage()}
+
+	for _, tc := range choice.Message.ToolCalls {
+		args := strings.TrimSpace(tc.Function.Arguments)
+		var input map[string]any
+		if args == "" {
+			input = map[string]any{}
+		} else if err := json.Unmarshal([]byte(args), &input); err != nil {
+			return nil, nil, fmt.Errorf("tool %s arguments: %w", tc.Function.Name, err)
+		}
+		response.ToolCalls = append(response.ToolCalls, model.ToolCall{
+			ID:    tc.ID,
+			Name:  tc.Function.Name,
+			Input: input,
+		})
+	}
+
+	rawMessage := map[string]any{
+		"content":    choice.Message.Content,
+		"tool_calls": choice.Message.ToolCalls,
+	}
+
+	return response, rawMessage, nil
+}

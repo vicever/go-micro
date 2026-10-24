@@ -1,9 +1,10 @@
-// Package selector is a way to load balance service nodes
+// Package selector is a way to pick a list of service nodes
 package selector
 
 import (
 	"errors"
-	"github.com/micro/go-micro/registry"
+
+	"go-micro.dev/v6/registry"
 )
 
 // Selector builds on the registry as a mechanism to pick nodes
@@ -25,22 +26,18 @@ type Selector interface {
 }
 
 // Next is a function that returns the next node
-// based on the selector's strategy
+// based on the selector's strategy.
 type Next func() (*registry.Node, error)
 
-// Filter is used to filter a service during the selection process
+// Filter is used to filter a service during the selection process.
 type Filter func([]*registry.Service) []*registry.Service
 
-// Strategy is a selection strategy e.g random, round robin
+// Strategy is a selection strategy e.g random, round robin.
 type Strategy func([]*registry.Service) Next
 
 var (
-	DefaultSelector = newDefaultSelector()
+	DefaultSelector = NewSelector()
 
 	ErrNotFound      = errors.New("not found")
 	ErrNoneAvailable = errors.New("none available")
 )
-
-func NewSelector(opts ...Option) Selector {
-	return newDefaultSelector(opts...)
-}

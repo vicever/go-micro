@@ -1,20 +1,23 @@
 package server
 
 import (
+	"context"
+	"errors"
+	"io"
 	"sync"
 
-	"golang.org/x/net/context"
+	"go-micro.dev/v6/codec"
 )
 
-// Implements the Streamer interface
+// Implements the Streamer interface.
 type rpcStream struct {
-	sync.RWMutex
-	seq     uint64
-	closed  bool
 	err     error
 	request Request
-	codec   serverCodec
+	codec   codec.Codec
 	context context.Context
+	id      string
+	sync.RWMutex
+	closed bool
 }
 
 func (r *rpcStream) Context() context.Context {
@@ -29,29 +32,63 @@ func (r *rpcStream) Send(msg interface{}) error {
 	r.Lock()
 	defer r.Unlock()
 
-	resp := response{
-		ServiceMethod: r.request.Method(),
-		Seq:           r.seq,
+	resp := codec.Message{
+		Target:   r.request.Service(),
+		Method:   r.request.Method(),
+		Endpoint: r.request.Endpoint(),
+		Id:       r.id,
+		Type:     codec.Response,
 	}
 
-	return r.codec.WriteResponse(&resp, msg, false)
-}
-
-func (r *rpcStream) Recv(msg interface{}) error {
-	r.Lock()
-	defer r.Unlock()
-
-	req := request{}
-
-	if err := r.codec.ReadRequestHeader(&req, false); err != nil {
-		// discard body
-		r.codec.ReadRequestBody(nil)
+	if err := r.codec.Write(&resp, msg); err != nil {
+		r.err = err
 		return err
 	}
 
+	return nil
+}
+
+func (r *rpcStream) Recv(msg interface{}) error {
+	req := new(codec.Message)
+	req.Type = codec.Request
+
+	err := r.codec.ReadHeader(req, req.Type)
+	r.Lock()
+	defer r.Unlock()
+	if err != nil {
+		// discard body
+		_ = r.codec.ReadBody(nil)
+		r.err = err
+		return err
+	}
+
+	// check the error
+	if len(req.Error) > 0 {
+		// Check the client closed the stream
+		switch req.Error {
+		case errLastStreamResponse.Error():
+			// discard body
+			r.Unlock()
+			_ = r.codec.ReadBody(nil)
+			r.Lock()
+			r.err = io.EOF
+			return io.EOF
+		default:
+			return errors.New(req.Error)
+		}
+	}
+
 	// we need to stay up to date with sequence numbers
-	r.seq = req.Seq
-	return r.codec.ReadRequestBody(msg)
+	r.id = req.Id
+	r.Unlock()
+	err = r.codec.ReadBody(msg)
+	r.Lock()
+	if err != nil {
+		r.err = err
+		return err
+	}
+
+	return nil
 }
 
 func (r *rpcStream) Error() error {
